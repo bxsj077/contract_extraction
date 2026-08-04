@@ -27,6 +27,19 @@ class CorrectionRequest(BaseModel):
     note: str = ""
 
 
+def _normalize_duration_correction(value: object | None) -> tuple[int | None, str]:
+    """Split a manual duration entry into a numeric value or a textual conclusion."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None, ""
+    if isinstance(value, bool):
+        raise ValueError("工期数值不能使用布尔值")
+    text = str(value).strip()
+    if re.fullmatch(r"\d+", text):
+        return int(text), ""
+    conclusion = text if text.startswith(("未明确", "按", "合同")) else f"未明确：{text}"
+    return None, conclusion
+
+
 def create_app(contract_root: Path | None = None, output_root: Path | None = None) -> FastAPI:
     project_root = Path(__file__).resolve().parents[2]
     root = contract_root or Path(os.getenv("CONTRACT_ROOT", str(project_root / "data" / "contracts")))
@@ -250,19 +263,27 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
             raise HTTPException(400, "该字段不允许人工纠正")
         if request.contract_key != "前向" and not re.fullmatch(r"后向:\d{3}", request.contract_key):
             raise HTTPException(400, "合同标识应为“前向”或“后向:001”格式")
-        if request.field_path == "time_plan.duration_value" and request.corrected_value not in (None, ""):
+        corrected_value = request.corrected_value
+        duration_conclusion = ""
+        if request.field_path == "time_plan.duration_value":
             try:
-                if int(request.corrected_value) < 0:
-                    raise ValueError
-            except (TypeError, ValueError):
-                raise HTTPException(400, "工期数值必须为非负整数或留空")
+                corrected_value, duration_conclusion = _normalize_duration_correction(request.corrected_value)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc))
         correction = service.store.save_correction(project_code, request.contract_key, request.field_path,
-                                                     request.corrected_value, request.note.strip())
+                                                     corrected_value, request.note.strip())
+        extra_correction = None
+        if duration_conclusion:
+            extra_correction = service.store.save_correction(
+                project_code, request.contract_key, "time_plan.duration_conclusion",
+                duration_conclusion, request.note.strip() or "由文字型工期纠正自动生成")
         found = scan_projects(service.contract_root, {project_code})
         if not found:
             raise HTTPException(404, "纠正记录已保存，但项目合同目录不存在，暂未重新计算")
         result = service.process_project(found[0], force=False)
-        return {"status": "已保存并重新计算", "correction": correction, "project_status": result.status,
+        status = "已按文字型工期保存并重新计算" if duration_conclusion else "已保存并重新计算"
+        return {"status": status, "correction": correction, "extra_correction": extra_correction,
+                "project_status": result.status,
                 "risk_level": result.risk_level}
 
     @app.delete("/api/projects/{project_code}/corrections/{correction_id}")

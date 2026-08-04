@@ -19,7 +19,7 @@ from .system_models import ContractStructured, ProjectFiles, ProjectReviewResult
 
 
 LOGGER = logging.getLogger("contract_review")
-PARSE_VERSION = "2026.08-v7-corrections-duration-feedback"
+PARSE_VERSION = "2026.08-v8-textual-duration-references"
 CORRECTABLE_FIELDS = {
     "contract_number", "contract_name", "party_a", "party_b", "sign_date", "effective_date", "contract_type",
     "procurement_involved", "procurement_note", "time_plan.duration_value", "time_plan.duration_unit",

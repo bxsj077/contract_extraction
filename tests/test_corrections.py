@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from contract_extraction.api import _normalize_duration_correction
 from contract_extraction.models import PageText
 from contract_extraction.review_service import ReviewService
 from contract_extraction.structured import _extract_time_plan
@@ -11,11 +12,28 @@ from contract_extraction.system_models import ContractStructured
 
 
 class CorrectionTests(unittest.TestCase):
+    def test_manual_duration_text_becomes_conclusion_not_number(self):
+        value, conclusion = _normalize_duration_correction("供货要求等合同文件另有约定")
+        self.assertIsNone(value)
+        self.assertEqual(conclusion, "未明确：供货要求等合同文件另有约定")
+
+    def test_manual_duration_digits_remain_numeric(self):
+        value, conclusion = _normalize_duration_correction("120")
+        self.assertEqual(value, 120)
+        self.assertEqual(conclusion, "")
+
     def test_external_reference_duration_is_reported(self):
         page = PageText("合同.pdf", "合同.pdf", 3, "履行时间(期限):按招标文件及投标文件执行。", "原生文本层")
         plan = _extract_time_plan("P1", "前向", [page], {}, [])
         self.assertIsNone(plan.duration_value)
         self.assertIn("按招标文件及投标文件执行", plan.duration_conclusion)
+        self.assertIn("需查阅", plan.calculation_status)
+
+    def test_other_contract_terms_duration_is_not_numeric(self):
+        page = PageText("合同.pdf", "合同.pdf", 4, "工期：供货要求等合同文件另有约定。", "原生文本层")
+        plan = _extract_time_plan("P1", "前向", [page], {}, [])
+        self.assertIsNone(plan.duration_value)
+        self.assertIn("供货要求等合同文件另有约定", plan.duration_conclusion)
         self.assertIn("需查阅", plan.calculation_status)
 
     def test_bracketed_numeric_duration_is_numeric(self):

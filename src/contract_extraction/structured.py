@@ -148,6 +148,9 @@ def _extract_time_plan(project: str, direction: str, pages: list[PageText], resu
         search_text = normalized_page
         external = re.search(r"(?:履行时间[（(]?期限[）)]?|履行期限|服务期限|合同期限|工期).{0,60}?按.{0,50}?"
                              r"(?:招标文件|投标文件|采购文件|技术规范书|任务书|订单).{0,30}?(?:执行|为准)", search_text)
+        other_contract_terms = re.search(
+            r"(?:(?:工期|履行期限|履行时间[（(]?期限[）)]?).{0,80}?)?"
+            r"((?:供货要求等)?(?:相关)?合同文件另有约定)", search_text)
         placeholder = re.search(r"[\[〔【（(]([^\]〕】）)]+)[\]〕】）)]\s*(工作日|日历天|天|日|个月|月|年)", search_text)
         explicit = re.search(r"(?:工期(?:为|共|：|:)?|周期(?:为|共|：|:)?|应于.{0,30}?(?:后|内))\s*(?:不超过|不少于|不多于|至多)?\s*([0-9]{1,4}|[一二两三四五六七八九十]{1,3})\s*(个?工作日|日历天|天|日|个月|月|年)", search_text)
         if external:
@@ -157,6 +160,13 @@ def _extract_time_plan(project: str, direction: str, pages: list[PageText], resu
             duration_raw = _sentence(page.text, raw_pos) if raw_pos >= 0 else sentence
             calculation_status = "工期未量化，需查阅合同引用的招标文件、投标文件或其他外部文件"
             duration_conclusion = "未明确：按招标文件及投标文件执行（需查阅引用文件）"
+            break
+        if other_contract_terms:
+            raw_pos = page.text.find("另有约定")
+            duration_raw = _sentence(page.text, raw_pos) if raw_pos >= 0 else sentence
+            reference_text = other_contract_terms.group(1)
+            calculation_status = "工期未量化，需查阅供货要求或其他相关合同文件"
+            duration_conclusion = f"未明确：{reference_text}（需查阅相关合同文件）"
             break
         if placeholder:
             marker = placeholder.group(0)
