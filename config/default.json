@@ -7,6 +7,7 @@
   "classification_margin": 2,
   "allow_partial_signing_date": true,
   "signing_date_policy": "latest_recognized",
-  "max_summary_chars": 1200
+  "max_summary_chars": 1200,
+  "safety_buffer_days": 15,
+  "rule_version": "2026.08-v1"
 }
-

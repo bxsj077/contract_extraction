@@ -1,4 +1,42 @@
-# 中文合同 PDF OCR 与结构化抽取
+# 前后向合同智能解析与履约风险审查系统
+
+当前版本已从单合同“文档解析与证据定位层”升级为项目级前后向合同审查平台。原 `contract-extract` 入口继续保留。
+
+## 项目级审查快速开始
+
+项目目录必须使用以下文件名：
+
+```text
+合同根目录/
+├─ PRJ20260001/
+│  ├─ 前向合同.pdf
+│  └─ 后向合同.pdf
+└─ PRJ20260002/
+   ├─ 前向合同.pdf
+   └─ 后向合同.pdf
+```
+
+批量处理并导出七张工作表：
+
+```powershell
+cd C:\Users\keyan\Documents\contract_extraction
+python -m pip install -e .
+contract-review --input "C:\合同根目录" --output "C:\合同审查结果"
+```
+
+启动 Web 系统：
+
+```powershell
+$env:CONTRACT_ROOT="C:\合同根目录"
+$env:CONTRACT_OUTPUT="C:\合同审查结果"
+python scripts\run_server.py
+```
+
+浏览器访问 `http://127.0.0.1:8000`，API 文档位于 `http://127.0.0.1:8000/docs`。
+
+系统包括：项目完整性扫描、前后向分别解析和缓存、SQLite 状态库、设备/数量/单位比较、实际时间区间及安全缓冲比较、实施范围和责任强度比较、风险分级、时间轴、人工复核接口、JSON/Excel 导出及 Web 看板。最终风险仅由版本化程序规则生成。
+
+## 第一层兼容入口
 
 面向“一个合同号一个文件夹、文件夹内一个或多个 PDF”的本地批处理项目。源 PDF 只读，OCR、缓存、JSON 和 Excel 全部写入独立输出目录。
 

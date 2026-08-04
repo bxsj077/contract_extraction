@@ -23,6 +23,10 @@ tmp/
 
 # Local configuration and secrets.
 .env
+review_output/
+*.db
+*.db-shm
+*.db-wal
 .env.*
 !.env.example
 .idea/

@@ -1,0 +1,10 @@
+services:
+  contract-review:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      CONTRACT_ROOT: /contracts
+      CONTRACT_OUTPUT: /data
+    volumes:
+      - ${CONTRACT_ROOT:-./sample_contracts}:/contracts:ro
+      - ${CONTRACT_OUTPUT:-./review_output}:/data

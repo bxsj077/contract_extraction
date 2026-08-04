@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contract-extraction-cn"
-version = "0.1.0"
-description = "Local-first Chinese PDF contract OCR and evidence-backed extraction pipeline"
+version = "0.2.0"
+description = "Local-first forward/backward Chinese contract extraction and deterministic performance-risk review system"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -14,6 +14,9 @@ dependencies = [
   "pypdf>=5,<7",
   "PyMuPDF>=1.24,<2",
   "rapidocr-onnxruntime>=1.4,<2",
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.34,<1",
+  "pydantic>=2.10,<3",
 ]
 
 [project.optional-dependencies]
@@ -21,12 +24,16 @@ dev = ["pytest>=8,<10", "ruff>=0.9,<1"]
 
 [project.scripts]
 contract-extract = "contract_extraction.cli:main"
+contract-review = "contract_extraction.review_cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+contract_extraction = ["web/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -35,4 +42,3 @@ addopts = "-q"
 [tool.ruff]
 line-length = 120
 target-version = "py310"
-
