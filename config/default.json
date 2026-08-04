@@ -1,0 +1,12 @@
+{
+  "native_text_min_chars": 80,
+  "native_text_min_cjk": 20,
+  "ocr_dpi": 300,
+  "signature_dpi": 600,
+  "ocr_review_threshold": 0.90,
+  "classification_margin": 2,
+  "allow_partial_signing_date": true,
+  "signing_date_policy": "latest_recognized",
+  "max_summary_chars": 1200
+}
+

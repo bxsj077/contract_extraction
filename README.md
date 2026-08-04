@@ -1,0 +1,93 @@
+# 中文合同 PDF OCR 与结构化抽取
+
+面向“一个合同号一个文件夹、文件夹内一个或多个 PDF”的本地批处理项目。源 PDF 只读，OCR、缓存、JSON 和 Excel 全部写入独立输出目录。
+
+## 已实现
+
+- 原生文本层质量检查；质量不足时整页 300DPI 本地 OCR。
+- 签章尾页自动执行 600DPI 局部增强思路：利用红色通道削弱红章，提高被印章遮挡日期的识别率。
+- 合同性质仅输出 `运维类`、`集成实施类` 或空值；运维类停止工期和条款深度抽取。
+- 集成实施类抽取工期、工期起算方式、具体日期、预计结束日期、到货/安装/部署/调试/上线/试运行/验收/交付/质保节点、服务内容、乙方义务和关键条款。
+- 甲方、乙方、其他方签约日期分别留列，并给出合同签约日期。
+- 三方合同只有部分签约日期时，可按配置用已识别日期参与“签约起算”推算，但在说明和证据中明确其不代表全部盖章生效日。
+- 低置信度或印章遮挡日期自动标为人工复核。
+- 每个非空抽取字段尽量保留来源文件、PDF 页码、原文、OCR/字段置信度与冲突说明。
+- 合同级 JSON 断点续跑、OCR 缓存、单合同重跑、强制重跑。
+
+## 安装
+
+需要 Python 3.10+。OCR 全程本地执行，不调用在线识别服务。
+
+```powershell
+cd C:\Users\keyan\Documents\contract_extraction
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -U pip
+python -m pip install -e .
+```
+
+## 目录约定
+
+```text
+合同根目录/
+├─ HT2026001/
+│  ├─ 主合同.pdf
+│  └─ 附件.pdf
+├─ HT2026002/
+│  └─ 合同扫描件.pdf
+└─ _合同提取结果/       # 建议输出到这里；不会当作合同扫描
+```
+
+## 执行
+
+```powershell
+contract-extract `
+  --input "C:\path\合同根目录" `
+  --output "C:\path\合同根目录\_合同提取结果"
+```
+
+也可不安装命令入口：
+
+```powershell
+python scripts\extract_contracts.py --input "C:\path\合同根目录" --output "C:\path\输出目录"
+```
+
+只处理指定合同号：
+
+```powershell
+contract-extract --input "C:\path\合同根目录" --output "C:\path\输出目录" --contracts HT2026001 HT2026003
+```
+
+强制重跑（忽略 JSON 断点与 OCR 缓存）：
+
+```powershell
+contract-extract --input "C:\path\合同根目录" --output "C:\path\输出目录" --force
+```
+
+## 输出
+
+- `合同信息提取_YYYYMMDD_HHMMSS.xlsx`
+  - `合同提取结果`
+  - `字段证据`
+  - `待人工复核`
+- `contracts/<合同号>.json`：单合同结构化结果和证据，便于断点续跑。
+- `ocr_cache/<合同号>/...`：普通 OCR 与签章增强 OCR 缓存。
+- `run_summary.json`：本次运行摘要。
+
+## 日期规则
+
+默认配置位于 `config/default.json`：
+
+- `signing_date_policy = latest_recognized`：多个签约日期候选中采用最晚的已识别日期作为合同签约日期。
+- `allow_partial_signing_date = true`：允许部分签约方日期参与签约起算推算。
+- 部分日期缺失会保留说明，不声称该日期就是三方全部盖章后的法律生效日。
+- 签章增强 OCR 置信度低于阈值时，`签约日期需人工确认=是`。
+
+规则抽取是可审计的初筛工具，不替代人工法律审查。建议重点复核签章页、生效条件、工作日计算和模糊扫描件。
+
+## 开发验证
+
+```powershell
+python -m unittest discover -s tests -v
+python -m compileall src scripts
+```

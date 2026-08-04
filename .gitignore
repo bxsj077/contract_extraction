@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Contract data and generated artifacts must never be committed.
+*.pdf
+*.PDF
+_合同提取结果/
+output/
+outputs/
+ocr_cache/
+text_corpus/
+candidate_reports/
+tmp/
+*.xlsx
+*.xls
+*.csv
+*.jsonl
+
+# Local configuration and secrets.
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
