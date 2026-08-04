@@ -66,7 +66,10 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
         code = project_code.strip()
         if not code or len(code) > 100 or re.search(r"[\\/:*?\"<>|]", code) or code in {".", ".."}:
             raise HTTPException(400, "项目编码为空、过长或包含非法路径字符")
-        folder = service.contract_root / code
+        single_project_mode = (service.contract_root / "前向").is_dir() or (service.contract_root / "后向").is_dir()
+        if single_project_mode and code != service.contract_root.name:
+            raise HTTPException(400, f"当前服务绑定单项目目录，只能上传项目 {service.contract_root.name}")
+        folder = service.contract_root if single_project_mode else service.contract_root / code
         if folder.exists() and not overwrite and any(folder.iterdir()):
             raise HTTPException(409, "项目已存在；如需替换，请勾选覆盖已有项目")
         forward_dir = folder / "前向"
