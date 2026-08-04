@@ -6,6 +6,7 @@ from pathlib import Path
 
 from contract_extraction.comparisons import compare_equipment, compare_schedule, compare_scopes
 from contract_extraction.api import create_app
+from contract_extraction.review_export import _header_cn
 from contract_extraction.project_io import scan_projects
 from contract_extraction.system_models import ContractStructured, EquipmentItem, ScopeItem, TimePlan
 
@@ -48,6 +49,12 @@ class ReviewSystemTests(unittest.TestCase):
             self.assertEqual(len(found.forward_pdfs), 2)
             self.assertEqual(len(found.backward_pdfs), 2)
             self.assertEqual(found.status, "可对比")
+
+    def test_export_headers_are_chinese(self):
+        self.assertEqual(_header_cn("risk_level"), "风险等级")
+        self.assertEqual(_header_cn("time_plan.start_date"), "实际起算日期")
+        self.assertEqual(_header_cn("time_plan.milestones.终验"), "时间节点-终验")
+        self.assertEqual(_header_cn("direction"), "结构化合同方向")
 
     def test_equipment_shortage(self):
         f, b = self.contract("前向"), self.contract("后向")
