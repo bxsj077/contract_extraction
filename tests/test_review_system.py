@@ -34,6 +34,8 @@ class ReviewSystemTests(unittest.TestCase):
             self.assertEqual(config["合同上传根目录"], str(root))
             self.assertEqual(config["审查结果目录"], str(output))
             self.assertTrue(root.exists())
+            self.assertTrue(any(getattr(route, "path", "") == "/api/tasks/{task_id}" for route in app.routes))
+            self.assertTrue(any(getattr(route, "path", "") == "/api/tasks" for route in app.routes))
 
     def test_single_project_root_with_multiple_backward_contracts(self):
         with tempfile.TemporaryDirectory() as tmp:
