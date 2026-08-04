@@ -34,6 +34,21 @@ class ReviewSystemTests(unittest.TestCase):
             self.assertEqual(config["审查结果目录"], str(output))
             self.assertTrue(root.exists())
 
+    def test_single_project_root_with_multiple_backward_contracts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "JSNJA2513970CGN00"
+            (project / "前向").mkdir(parents=True)
+            (project / "后向").mkdir()
+            (project / "前向" / "主合同.pdf").touch()
+            (project / "前向" / "附件.pdf").touch()
+            (project / "后向" / "采购A.pdf").touch()
+            (project / "后向" / "采购B.pdf").touch()
+            found = scan_projects(project)[0]
+            self.assertEqual(found.project_code, "JSNJA2513970CGN00")
+            self.assertEqual(len(found.forward_pdfs), 2)
+            self.assertEqual(len(found.backward_pdfs), 2)
+            self.assertEqual(found.status, "可对比")
+
     def test_equipment_shortage(self):
         f, b = self.contract("前向"), self.contract("后向")
         f.equipment = [EquipmentItem(standard_name="核心交换机", model="S6730", unit="台", quantity=2, evidence_id="F")]

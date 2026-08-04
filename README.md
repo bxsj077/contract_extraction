@@ -4,16 +4,20 @@
 
 ## 项目级审查快速开始
 
-项目目录必须使用以下文件名：
+推荐目录结构如下。一级目录名称就是前向合同编号；前向可包含主合同及附件，后向允许任意多份合同：
 
 ```text
 合同根目录/
-├─ PRJ20260001/
-│  ├─ 前向合同.pdf
-│  └─ 后向合同.pdf
-└─ PRJ20260002/
-   ├─ 前向合同.pdf
-   └─ 后向合同.pdf
+├─ JSNJA2513970CGN00/
+│  ├─ 前向/
+│  │  ├─ 前向主合同.pdf
+│  │  └─ 技术附件.pdf
+│  └─ 后向/
+│     ├─ 后向合同A.pdf
+│     └─ 后向合同B.pdf
+└─ JSNJA2600045CGN00/
+   ├─ 前向/
+   └─ 后向/
 ```
 
 批量处理并导出七张工作表：
@@ -34,11 +38,11 @@ python scripts\run_server.py
 
 浏览器访问 `http://127.0.0.1:8000`，API 文档位于 `http://127.0.0.1:8000/docs`。
 
-首页可直接输入项目编码并分别上传前向、后向 PDF。未设置环境变量时，文件和结果默认保存为：
+首页可直接输入前向合同编号，并多选上传前向附件和多份后向合同。未设置环境变量时，文件和结果默认保存为：
 
 ```text
-C:\Users\keyan\Documents\contract_extraction\data\contracts\<项目编码>\前向合同.pdf
-C:\Users\keyan\Documents\contract_extraction\data\contracts\<项目编码>\后向合同.pdf
+C:\Users\keyan\Documents\contract_extraction\data\contracts\<前向合同编号>\前向\*.pdf
+C:\Users\keyan\Documents\contract_extraction\data\contracts\<前向合同编号>\后向\*.pdf
 C:\Users\keyan\Documents\contract_extraction\data\review_output\contract_review.db
 C:\Users\keyan\Documents\contract_extraction\data\review_output\项目明细\<项目编码>\
 ```

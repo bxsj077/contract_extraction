@@ -41,7 +41,7 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
     def config():
         return {"合同上传根目录": str(service.contract_root), "审查结果目录": str(service.output_root),
                 "项目数据库": str(service.store.path),
-                "目录格式": "<合同上传根目录>/<项目编码>/前向合同.pdf、后向合同.pdf"}
+                "目录格式": "<根目录>/<前向合同编号>/前向/*.pdf、后向/*.pdf；根目录也可直接指向单个合同编号目录"}
 
     async def save_pdf(upload: UploadFile, target: Path) -> None:
         if not upload.filename or Path(upload.filename).suffix.lower() != ".pdf":
@@ -60,8 +60,8 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
             await upload.close()
 
     @app.post("/api/projects/upload")
-    async def upload_project(project_code: str = Form(...), forward_pdf: UploadFile = File(...),
-                             backward_pdf: UploadFile = File(...), overwrite: bool = Query(False),
+    async def upload_project(project_code: str = Form(...), forward_pdfs: list[UploadFile] = File(...),
+                             backward_pdfs: list[UploadFile] = File(...), overwrite: bool = Query(False),
                              process_now: bool = Query(True)):
         code = project_code.strip()
         if not code or len(code) > 100 or re.search(r"[\\/:*?\"<>|]", code) or code in {".", ".."}:
@@ -69,16 +69,34 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
         folder = service.contract_root / code
         if folder.exists() and not overwrite and any(folder.iterdir()):
             raise HTTPException(409, "项目已存在；如需替换，请勾选覆盖已有项目")
-        folder.mkdir(parents=True, exist_ok=True)
+        forward_dir = folder / "前向"
+        backward_dir = folder / "后向"
+        if overwrite:
+            shutil.rmtree(forward_dir, ignore_errors=True)
+            shutil.rmtree(backward_dir, ignore_errors=True)
+        forward_dir.mkdir(parents=True, exist_ok=True)
+        backward_dir.mkdir(parents=True, exist_ok=True)
         try:
-            await save_pdf(forward_pdf, folder / "前向合同.pdf")
-            await save_pdf(backward_pdf, folder / "后向合同.pdf")
+            forward_paths = []
+            for index, upload in enumerate(forward_pdfs, 1):
+                name = re.sub(r"[\\/:*?\"<>|]", "_", Path(upload.filename or f"前向_{index}.pdf").name)
+                target = forward_dir / name
+                if target.exists():
+                    target = forward_dir / f"{index:03d}_{name}"
+                await save_pdf(upload, target); forward_paths.append(str(target))
+            backward_paths = []
+            for index, upload in enumerate(backward_pdfs, 1):
+                name = re.sub(r"[\\/:*?\"<>|]", "_", Path(upload.filename or f"后向_{index}.pdf").name)
+                target = backward_dir / name
+                if target.exists():
+                    target = backward_dir / f"{index:03d}_{name}"
+                await save_pdf(upload, target); backward_paths.append(str(target))
         except Exception:
             if not any(folder.iterdir()):
                 shutil.rmtree(folder, ignore_errors=True)
             raise
-        payload = {"项目编码": code, "项目目录": str(folder), "前向合同": str(folder / "前向合同.pdf"),
-                   "后向合同": str(folder / "后向合同.pdf"), "处理状态": "已上传"}
+        payload = {"项目编码": code, "项目目录": str(folder), "前向文件": forward_paths,
+                   "后向合同": backward_paths, "后向合同数量": len(backward_paths), "处理状态": "已上传"}
         if process_now:
             project = scan_projects(service.contract_root, {code})[0]
             payload["审查结果"] = service.process_project(project, force=overwrite).to_dict()

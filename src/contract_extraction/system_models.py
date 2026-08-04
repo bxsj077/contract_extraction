@@ -8,11 +8,19 @@ from typing import Any
 class ProjectFiles:
     project_code: str
     folder: str
-    forward_pdf: str | None
-    backward_pdf: str | None
+    forward_pdfs: list[str] = field(default_factory=list)
+    backward_pdfs: list[str] = field(default_factory=list)
     extra_pdfs: list[str] = field(default_factory=list)
     status: str = "待处理"
     issues: list[str] = field(default_factory=list)
+
+    @property
+    def forward_pdf(self) -> str | None:
+        return self.forward_pdfs[0] if self.forward_pdfs else None
+
+    @property
+    def backward_pdf(self) -> str | None:
+        return self.backward_pdfs[0] if self.backward_pdfs else None
 
 
 @dataclass(slots=True)
@@ -122,6 +130,7 @@ class ProjectReviewResult:
     review_issues: list[dict[str, Any]] = field(default_factory=list)
     rule_version: str = "2026.08-v1"
     processed_at: str = ""
+    backward_contracts: list[ContractStructured] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
