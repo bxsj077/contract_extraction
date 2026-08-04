@@ -34,6 +34,17 @@ python scripts\run_server.py
 
 浏览器访问 `http://127.0.0.1:8000`，API 文档位于 `http://127.0.0.1:8000/docs`。
 
+首页可直接输入项目编码并分别上传前向、后向 PDF。未设置环境变量时，文件和结果默认保存为：
+
+```text
+C:\Users\keyan\Documents\contract_extraction\data\contracts\<项目编码>\前向合同.pdf
+C:\Users\keyan\Documents\contract_extraction\data\contracts\<项目编码>\后向合同.pdf
+C:\Users\keyan\Documents\contract_extraction\data\review_output\contract_review.db
+C:\Users\keyan\Documents\contract_extraction\data\review_output\项目明细\<项目编码>\
+```
+
+首页会显示本次服务实际使用的上传目录、结果目录和数据库路径，避免误扫描代码目录。
+
 系统包括：项目完整性扫描、前后向分别解析和缓存、SQLite 状态库、设备/数量/单位比较、实际时间区间及安全缓冲比较、实施范围和责任强度比较、风险分级、时间轴、人工复核接口、JSON/Excel 导出及 Web 看板。最终风险仅由版本化程序规则生成。
 
 ## 第一层兼容入口

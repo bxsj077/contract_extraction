@@ -24,6 +24,7 @@ tmp/
 # Local configuration and secrets.
 .env
 review_output/
+data/
 *.db
 *.db-shm
 *.db-wal

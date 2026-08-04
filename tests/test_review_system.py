@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from contract_extraction.comparisons import compare_equipment, compare_schedule, compare_scopes
+from contract_extraction.api import create_app
 from contract_extraction.project_io import scan_projects
 from contract_extraction.system_models import ContractStructured, EquipmentItem, ScopeItem, TimePlan
 
@@ -21,6 +22,17 @@ class ReviewSystemTests(unittest.TestCase):
             self.assertEqual(project.project_code, "000123")
             self.assertEqual(project.status, "可解析单份合同")
             self.assertIn("缺少后向合同", project.issues)
+
+    def test_api_uses_explicit_storage_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "contracts"
+            output = Path(tmp) / "results"
+            app = create_app(root, output)
+            config_route = next(route for route in app.routes if getattr(route, "path", "") == "/api/config")
+            config = config_route.endpoint()
+            self.assertEqual(config["合同上传根目录"], str(root))
+            self.assertEqual(config["审查结果目录"], str(output))
+            self.assertTrue(root.exists())
 
     def test_equipment_shortage(self):
         f, b = self.contract("前向"), self.contract("后向")

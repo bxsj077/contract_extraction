@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
@@ -18,9 +20,12 @@ class ResolveRequest(BaseModel):
 
 
 def create_app(contract_root: Path | None = None, output_root: Path | None = None) -> FastAPI:
-    root = contract_root or (Path(os.environ["CONTRACT_ROOT"]) if os.getenv("CONTRACT_ROOT") else None)
-    output = output_root or Path(os.getenv("CONTRACT_OUTPUT", "./review_output"))
-    service = ReviewService(root or Path("."), output)
+    project_root = Path(__file__).resolve().parents[2]
+    root = contract_root or Path(os.getenv("CONTRACT_ROOT", str(project_root / "data" / "contracts")))
+    output = output_root or Path(os.getenv("CONTRACT_OUTPUT", str(project_root / "data" / "review_output")))
+    root.mkdir(parents=True, exist_ok=True)
+    output.mkdir(parents=True, exist_ok=True)
+    service = ReviewService(root, output)
     app = FastAPI(title="前后向合同智能解析与履约风险审查系统", version="0.2.0")
     app.state.service = service
 
@@ -31,6 +36,54 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
     @app.get("/api/health")
     def health():
         return {"status": "ok", "contract_root": str(service.contract_root), "output_root": str(service.output_root)}
+
+    @app.get("/api/config")
+    def config():
+        return {"合同上传根目录": str(service.contract_root), "审查结果目录": str(service.output_root),
+                "项目数据库": str(service.store.path),
+                "目录格式": "<合同上传根目录>/<项目编码>/前向合同.pdf、后向合同.pdf"}
+
+    async def save_pdf(upload: UploadFile, target: Path) -> None:
+        if not upload.filename or Path(upload.filename).suffix.lower() != ".pdf":
+            raise HTTPException(400, f"{target.name}必须上传PDF文件")
+        temporary = target.with_suffix(".uploading")
+        try:
+            with temporary.open("wb") as stream:
+                while chunk := await upload.read(1024 * 1024):
+                    stream.write(chunk)
+            with temporary.open("rb") as stream:
+                if stream.read(5) != b"%PDF-":
+                    raise HTTPException(400, f"{upload.filename}不是有效PDF文件")
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+            await upload.close()
+
+    @app.post("/api/projects/upload")
+    async def upload_project(project_code: str = Form(...), forward_pdf: UploadFile = File(...),
+                             backward_pdf: UploadFile = File(...), overwrite: bool = Query(False),
+                             process_now: bool = Query(True)):
+        code = project_code.strip()
+        if not code or len(code) > 100 or re.search(r"[\\/:*?\"<>|]", code) or code in {".", ".."}:
+            raise HTTPException(400, "项目编码为空、过长或包含非法路径字符")
+        folder = service.contract_root / code
+        if folder.exists() and not overwrite and any(folder.iterdir()):
+            raise HTTPException(409, "项目已存在；如需替换，请勾选覆盖已有项目")
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            await save_pdf(forward_pdf, folder / "前向合同.pdf")
+            await save_pdf(backward_pdf, folder / "后向合同.pdf")
+        except Exception:
+            if not any(folder.iterdir()):
+                shutil.rmtree(folder, ignore_errors=True)
+            raise
+        payload = {"项目编码": code, "项目目录": str(folder), "前向合同": str(folder / "前向合同.pdf"),
+                   "后向合同": str(folder / "后向合同.pdf"), "处理状态": "已上传"}
+        if process_now:
+            project = scan_projects(service.contract_root, {code})[0]
+            payload["审查结果"] = service.process_project(project, force=overwrite).to_dict()
+            payload["处理状态"] = "已处理"
+        return payload
 
     @app.get("/api/dashboard")
     def dashboard():
