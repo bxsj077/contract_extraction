@@ -13,11 +13,18 @@ from pydantic import BaseModel
 
 from .project_io import scan_projects
 from .review_export import export_review
-from .review_service import ReviewService
+from .review_service import CORRECTABLE_FIELDS, ReviewService
 
 
 class ResolveRequest(BaseModel):
     resolution: str
+
+
+class CorrectionRequest(BaseModel):
+    contract_key: str
+    field_path: str
+    corrected_value: object | None = None
+    note: str = ""
 
 
 def create_app(contract_root: Path | None = None, output_root: Path | None = None) -> FastAPI:
@@ -74,6 +81,21 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
                 "项目数据库": str(service.store.path),
                 "后台运行日志": str(service.output_root / "logs" / "contract_review.log"),
                 "目录格式": "<根目录>/<前向合同编号>/前向/*.pdf、后向/*.pdf；根目录也可直接指向单个合同编号目录"}
+
+    @app.get("/api/correction-fields")
+    def correction_fields():
+        labels = {
+            "contract_number": "合同编号", "contract_name": "合同名称", "party_a": "甲方", "party_b": "乙方",
+            "sign_date": "合同签订日期", "effective_date": "合同生效日期", "contract_type": "合同性质",
+            "procurement_involved": "是否涉及货物采购", "procurement_note": "货物采购说明",
+            "time_plan.duration_value": "工期数值", "time_plan.duration_unit": "工期单位",
+            "time_plan.duration_conclusion": "工期提取结论", "time_plan.duration_raw": "工期约定原文",
+            "time_plan.calculation_status": "工期计算状态", "time_plan.start_condition_type": "起算条件类型",
+            "time_plan.start_condition_text": "起算条件原文", "time_plan.start_date": "实际起算日期",
+            "time_plan.finish_date": "预计完成日期", "time_plan.completion_node": "完成节点",
+            "time_plan.fixed_deadline": "固定截止日期",
+        }
+        return [{"field_path": field, "label": labels.get(field, field)} for field in sorted(CORRECTABLE_FIELDS)]
 
     @app.get("/api/tasks")
     def task_list():
@@ -168,6 +190,40 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
         if not payload:
             raise HTTPException(404, "项目不存在或尚未处理")
         return payload
+
+    @app.get("/api/projects/{project_code}/corrections")
+    def corrections(project_code: str):
+        return service.store.list_corrections(project_code)
+
+    @app.post("/api/projects/{project_code}/corrections")
+    def save_correction(project_code: str, request: CorrectionRequest):
+        if request.field_path not in CORRECTABLE_FIELDS:
+            raise HTTPException(400, "该字段不允许人工纠正")
+        if request.contract_key != "前向" and not re.fullmatch(r"后向:\d{3}", request.contract_key):
+            raise HTTPException(400, "合同标识应为“前向”或“后向:001”格式")
+        if request.field_path == "time_plan.duration_value" and request.corrected_value not in (None, ""):
+            try:
+                if int(request.corrected_value) < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise HTTPException(400, "工期数值必须为非负整数或留空")
+        correction = service.store.save_correction(project_code, request.contract_key, request.field_path,
+                                                     request.corrected_value, request.note.strip())
+        found = scan_projects(service.contract_root, {project_code})
+        if not found:
+            raise HTTPException(404, "纠正记录已保存，但项目合同目录不存在，暂未重新计算")
+        result = service.process_project(found[0], force=False)
+        return {"status": "已保存并重新计算", "correction": correction, "project_status": result.status,
+                "risk_level": result.risk_level}
+
+    @app.delete("/api/projects/{project_code}/corrections/{correction_id}")
+    def remove_correction(project_code: str, correction_id: int):
+        existing = next((x for x in service.store.list_corrections(project_code) if x["id"] == correction_id), None)
+        if not existing or not service.store.delete_correction(correction_id):
+            raise HTTPException(404, "人工纠正记录不存在")
+        found = scan_projects(service.contract_root, {project_code})
+        result = service.process_project(found[0], force=False) if found else None
+        return {"status": "已删除并重新计算" if result else "已删除", "project_status": result.status if result else ""}
 
     @app.post("/api/scan")
     def scan(force: bool = Query(False)):

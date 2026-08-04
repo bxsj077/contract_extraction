@@ -1,0 +1,44 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from contract_extraction.models import PageText
+from contract_extraction.review_service import ReviewService
+from contract_extraction.structured import _extract_time_plan
+from contract_extraction.system_models import ContractStructured
+
+
+class CorrectionTests(unittest.TestCase):
+    def test_external_reference_duration_is_reported(self):
+        page = PageText("合同.pdf", "合同.pdf", 3, "履行时间(期限):按招标文件及投标文件执行。", "原生文本层")
+        plan = _extract_time_plan("P1", "前向", [page], {}, [])
+        self.assertIsNone(plan.duration_value)
+        self.assertIn("按招标文件及投标文件执行", plan.duration_conclusion)
+        self.assertIn("需查阅", plan.calculation_status)
+
+    def test_bracketed_numeric_duration_is_numeric(self):
+        page = PageText("合同.pdf", "合同.pdf", 3, "工期：本合同生效后[120]天。", "原生文本层")
+        plan = _extract_time_plan("P1", "后向", [page], {}, [])
+        self.assertEqual(plan.duration_value, 120)
+        self.assertEqual(plan.duration_unit, "天")
+        self.assertEqual(plan.duration_conclusion, "120天")
+
+    def test_manual_duration_correction_is_persistent_and_recalculates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ReviewService(root / "contracts", root / "output")
+            service.store.save_correction("P1", "前向", "time_plan.duration_value", 30, "人工核对")
+            service.store.save_correction("P1", "前向", "time_plan.duration_unit", "日", "人工核对")
+            service.store.save_correction("P1", "前向", "time_plan.start_date", "2026-01-01", "人工核对")
+            contract = ContractStructured("P1", "前向")
+            corrected = service._apply_corrections(contract, "前向")
+            self.assertEqual(corrected.time_plan.duration_value, 30)
+            self.assertEqual(corrected.time_plan.finish_date, "2026-01-31")
+            self.assertEqual(corrected.parse_metadata["correction_count"], 3)
+            self.assertEqual(len(service.store.list_corrections("P1")), 3)
+
+
+if __name__ == "__main__":
+    unittest.main()

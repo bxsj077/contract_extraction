@@ -5,7 +5,7 @@ import json
 import logging
 import re
 from copy import deepcopy
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from .comparisons import RESPONSIBILITY_SCORE, compare_equipment, compare_schedule, compare_scopes, overall_risk
@@ -19,7 +19,14 @@ from .system_models import ContractStructured, ProjectFiles, ProjectReviewResult
 
 
 LOGGER = logging.getLogger("contract_review")
-PARSE_VERSION = "2026.08-v5-time-equipment-status"
+PARSE_VERSION = "2026.08-v7-corrections-duration-feedback"
+CORRECTABLE_FIELDS = {
+    "contract_number", "contract_name", "party_a", "party_b", "sign_date", "effective_date", "contract_type",
+    "procurement_involved", "procurement_note", "time_plan.duration_value", "time_plan.duration_unit",
+    "time_plan.duration_conclusion", "time_plan.duration_raw", "time_plan.calculation_status",
+    "time_plan.start_condition_type", "time_plan.start_condition_text", "time_plan.start_date",
+    "time_plan.finish_date", "time_plan.completion_node", "time_plan.fixed_deadline",
+}
 
 
 def _bundle_hash(paths: list[str]) -> str:
@@ -51,6 +58,52 @@ class ReviewService:
             handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
             LOGGER.addHandler(handler)
             LOGGER.setLevel(logging.INFO)
+
+    def _apply_corrections(self, contract: ContractStructured | None, contract_key: str) -> ContractStructured | None:
+        if contract is None:
+            return None
+        applied = []
+        corrected_paths: set[str] = set()
+        for correction in self.store.list_corrections(contract.project_code):
+            field_path = correction["field_path"]
+            if correction["contract_key"] != contract_key or field_path not in CORRECTABLE_FIELDS:
+                continue
+            value = correction["corrected_value"]
+            if field_path == "time_plan.duration_value" and value not in (None, ""):
+                value = int(value)
+            elif field_path == "procurement_involved" and isinstance(value, str):
+                value = value.strip().lower() in {"true", "1", "是", "涉及"}
+            target: object = contract
+            parts = field_path.split(".")
+            for part in parts[:-1]:
+                target = getattr(target, part)
+            setattr(target, parts[-1], value)
+            corrected_paths.add(field_path)
+            applied.append({"id": correction["id"], "contract_key": contract_key, "field_path": field_path,
+                            "corrected_value": value, "note": correction.get("note", ""),
+                            "updated_at": correction.get("updated_at", "")})
+        if not applied:
+            return contract
+        plan = contract.time_plan
+        if "time_plan.duration_value" in corrected_paths or "time_plan.duration_unit" in corrected_paths:
+            if plan.duration_value is not None:
+                if "time_plan.duration_conclusion" not in corrected_paths:
+                    plan.duration_conclusion = f"人工确认：{plan.duration_value}{plan.duration_unit}"
+                if plan.start_date and plan.duration_unit in {"日", "天", "工作日", "日历天", "个工作日"}:
+                    try:
+                        plan.finish_date = (date.fromisoformat(plan.start_date) + timedelta(days=plan.duration_value)).isoformat()
+                        plan.calculation_status = "已按人工确认的工期计算完成日期"
+                    except ValueError:
+                        plan.finish_date = None
+                        plan.calculation_status = "人工确认的起算日期格式无效，应使用YYYY-MM-DD"
+                else:
+                    plan.finish_date = None
+                    plan.calculation_status = "工期已人工确认，但缺少可计算的起算日期或单位"
+            else:
+                plan.finish_date = None
+        contract.parse_metadata["applied_corrections"] = applied
+        contract.parse_metadata["correction_count"] = len(applied)
+        return contract
 
     def _parse_bundle(self, project: ProjectFiles, direction: str, paths: list[str], cache_key: str,
                       output_name: str, force: bool) -> ContractStructured | None:
@@ -142,6 +195,7 @@ class ReviewService:
                 "计算日期": max((str(x.get("计算日期")) for x in node_values if x.get("计算日期")), default=""),
                 "计算状态": statuses[0] if len(statuses) == 1 else "多份后向合同节点约定不一致：" + "；".join(statuses)}
         calc_statuses = list(dict.fromkeys(p.calculation_status for p in plans if p.calculation_status))
+        conclusions = list(dict.fromkeys(p.duration_conclusion for p in plans if p.duration_conclusion))
         aggregate.time_plan = TimePlan(duration_value=max(durations) if durations else None,
             duration_unit=next((p.duration_unit for p in plans if p.duration_unit), ""),
             start_condition_type=conditions.pop() if len(conditions) == 1 else "多个后向合同起算条件不一致",
@@ -152,7 +206,8 @@ class ReviewService:
             confidence=min((p.confidence for p in plans), default=0.0),
             duration_raw="；".join(dict.fromkeys(p.duration_raw for p in plans if p.duration_raw)),
             calculation_status=calc_statuses[0] if len(calc_statuses) == 1 else "；".join(calc_statuses),
-            milestone_details=milestone_details)
+            milestone_details=milestone_details,
+            duration_conclusion=conclusions[0] if len(conclusions) == 1 else "；".join(conclusions))
         aggregate.sign_date = max((c.sign_date for c in contracts if c.sign_date), default=None)
         aggregate.parse_metadata = {"aggregation": "multiple_backward_contracts", "contract_count": len(contracts),
                                     "source_contracts": [c.parse_metadata for c in contracts]}
@@ -178,6 +233,7 @@ class ReviewService:
             for stale in detail.glob("后向合同_*_解析结果.json"):
                 stale.unlink(missing_ok=True)
             forward = self._parse_bundle(project, "前向", project.forward_pdfs, "前向", "前向合同解析结果", force)
+            forward = self._apply_corrections(forward, "前向")
             backward_contracts = []
             for index, path in enumerate(project.backward_pdfs, 1):
                 name = Path(path).stem
@@ -185,6 +241,7 @@ class ReviewService:
                                             f"后向合同_{index:03d}_{name}_解析结果", force)
                 if parsed:
                     parsed.contract_name = parsed.contract_name or name
+                    parsed = self._apply_corrections(parsed, f"后向:{index:03d}")
                     backward_contracts.append(parsed)
             backward = self._aggregate_backward(project.project_code, backward_contracts)
             equipment = []; schedule = []; scopes = []

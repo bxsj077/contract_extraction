@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   stage TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0, payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS field_corrections (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, project_code TEXT NOT NULL,
+  contract_key TEXT NOT NULL, field_path TEXT NOT NULL, corrected_value_json TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  UNIQUE(project_code, contract_key, field_path)
+);
 """
 
 
@@ -46,11 +53,19 @@ class ReviewStore:
         with self.connect() as db:
             db.executescript(SCHEMA)
 
-    def connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def connect(self):
         db = sqlite3.connect(self.path)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA journal_mode=WAL")
-        return db
+        try:
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
     def upsert_project(self, project_code: str, folder: str, status: str, risk: str, payload: dict[str, Any]) -> None:
         now = datetime.now().isoformat(timespec="seconds")
@@ -126,6 +141,41 @@ class ReviewStore:
         with self.connect() as db:
             rows = db.execute("SELECT payload_json FROM tasks ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+    def save_correction(self, project_code: str, contract_key: str, field_path: str,
+                        corrected_value: Any, note: str = "") -> dict[str, Any]:
+        now = datetime.now().isoformat(timespec="seconds")
+        encoded = json.dumps(corrected_value, ensure_ascii=False)
+        with self.connect() as db:
+            db.execute("""INSERT INTO field_corrections(project_code,contract_key,field_path,corrected_value_json,note,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?) ON CONFLICT(project_code,contract_key,field_path) DO UPDATE SET
+                corrected_value_json=excluded.corrected_value_json,note=excluded.note,updated_at=excluded.updated_at""",
+                (project_code, contract_key, field_path, encoded, note, now, now))
+            row = db.execute("SELECT * FROM field_corrections WHERE project_code=? AND contract_key=? AND field_path=?",
+                             (project_code, contract_key, field_path)).fetchone()
+        return self._correction_row(row)
+
+    @staticmethod
+    def _correction_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["corrected_value"] = json.loads(result.pop("corrected_value_json"))
+        return result
+
+    def list_corrections(self, project_code: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM field_corrections"
+        args: tuple[Any, ...] = ()
+        if project_code:
+            query += " WHERE project_code=?"
+            args = (project_code,)
+        query += " ORDER BY project_code,contract_key,field_path"
+        with self.connect() as db:
+            rows = db.execute(query, args).fetchall()
+        return [self._correction_row(row) for row in rows]
+
+    def delete_correction(self, correction_id: int) -> bool:
+        with self.connect() as db:
+            cursor = db.execute("DELETE FROM field_corrections WHERE id=?", (correction_id,))
+            return cursor.rowcount == 1
 
     def dashboard(self) -> dict[str, int]:
         projects = self.list_projects()

@@ -20,6 +20,7 @@ HEADER_CN = {
     "time_plan.start_date": "实际起算日期", "time_plan.finish_date": "预计完成日期",
     "time_plan.completion_node": "完成节点", "time_plan.fixed_deadline": "固定截止日期",
     "time_plan.duration_raw": "工期约定原文", "time_plan.calculation_status": "工期计算状态",
+    "time_plan.duration_conclusion": "工期提取结论",
     "time_plan.confidence": "工期置信度", "key_clauses.服务内容": "服务内容条款",
     "key_clauses.乙方义务": "乙方义务条款", "key_clauses.关键条款": "其他关键条款",
     "parse_metadata.file_hash": "文件哈希", "parse_metadata.parse_version": "解析版本",
@@ -33,6 +34,8 @@ HEADER_CN = {
     "backward": "后向结构化内容", "evidence_ids": "证据编号", "needs_review": "是否需人工复核",
     "node": "时间节点", "difference": "差异说明", "id": "复核编号", "resolution": "复核结论",
     "created_at": "创建时间", "resolved_at": "复核完成时间",
+    "contract_key": "合同标识", "field_path": "纠正字段", "corrected_value": "人工确认值",
+    "note": "纠正说明", "updated_at": "更新时间",
 }
 
 
@@ -114,6 +117,14 @@ def export_review(store: ReviewStore, path: Path) -> Path:
             if contract:
                 row = {"项目编码": p["project_code"], "合同方向": contract.get("direction", "")}
                 _flatten("", {k: v for k, v in contract.items() if k not in {"equipment", "scopes", "evidence"}}, row)
+                if "time_plan.duration_conclusion" in row:
+                    conclusion = row.pop("time_plan.duration_conclusion")
+                    reordered = {}
+                    for key, value in row.items():
+                        reordered[key] = value
+                        if key == "time_plan.duration_unit":
+                            reordered["time_plan.duration_conclusion"] = conclusion
+                    row = reordered
                 contracts.append(row)
                 if contract.get("equipment"):
                     for item in contract["equipment"]:
@@ -131,7 +142,7 @@ def export_review(store: ReviewStore, path: Path) -> Path:
     for title, rows in (("项目处理汇总", summary), ("合同解析状态", parse_statuses), ("前后向合同解析结果", contracts),
                         ("设备材料清单", equipment_items), ("设备材料差异", equipment),
                         ("工期衔接风险", schedules), ("实施内容差异", scopes), ("项目时间轴", timeline),
-                        ("待人工复核", store.list_issues())):
+                        ("人工纠正记录", store.list_corrections()), ("待人工复核", store.list_issues())):
         _add_sheet(wb, title, rows)
     path.parent.mkdir(parents=True, exist_ok=True); wb.save(path)
     return path

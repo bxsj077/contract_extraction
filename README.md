@@ -152,3 +152,12 @@ python -m compileall src scripts
 python scripts/check_status.py --output "C:\Users\keyan\Documents\contract_extraction\data\review_output" --project JSNJA2513970CGN00
 Get-Content "C:\Users\keyan\Documents\contract_extraction\data\review_output\logs\contract_review.log" -Wait
 ```
+
+## 人工纠正
+
+网页首页的“人工纠正识别结果”支持按项目、合同和字段保存人工确认值。合同标识使用：
+
+- `前向`：前向合同及附件合并结果；
+- `后向:001`、`后向:002`：按后向目录文件名排序后的第1、第2份后向合同。
+
+纠正记录保存在 `contract_review.db` 的 `field_corrections` 表中，重新OCR不会覆盖。保存或删除纠正后，系统会基于OCR缓存自动重新计算审查结果。工期没有明确数字时，“工期数值”保持为空，并通过“工期提取结论”和“工期计算状态”反馈“随道路建设周期”“双方另行确认”或“按招标文件及投标文件执行”等非量化约定。

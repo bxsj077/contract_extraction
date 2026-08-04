@@ -135,37 +135,55 @@ def _extract_time_plan(project: str, direction: str, pages: list[PageText], resu
                        evidence: list[EvidenceRef]) -> TimePlan:
     candidates: list[tuple[PageText, str]] = []
     for page in pages:
-        for term in ("工期", "建设周期", "实施周期"):
-            if term in page.text:
-                candidates.append((page, _time_sentence(page, term)))
-                break
+        for match in re.finditer(r"工期|建设周期|实施周期|履行时间\s*[（(]?期限[）)]?|履行期限|服务期限|合同期限", page.text):
+            candidates.append((page, _sentence(page.text, match.start())))
     duration_value = None
     duration_unit = ""
     duration_raw = ""
     calculation_status = "合同未约定具体工期"
+    duration_conclusion = "未明确：合同未约定具体工期"
     for page, sentence in candidates:
         normalized_page = re.sub(r"\s+", "", page.text)
         normalized = re.sub(r"\s+", "", sentence)
         search_text = normalized_page
+        external = re.search(r"(?:履行时间[（(]?期限[）)]?|履行期限|服务期限|合同期限|工期).{0,60}?按.{0,50}?"
+                             r"(?:招标文件|投标文件|采购文件|技术规范书|任务书|订单).{0,30}?(?:执行|为准)", search_text)
         placeholder = re.search(r"[\[〔【（(]([^\]〕】）)]+)[\]〕】）)]\s*(工作日|日历天|天|日|个月|月|年)", search_text)
         explicit = re.search(r"(?:工期(?:为|共|：|:)?|周期(?:为|共|：|:)?|应于.{0,30}?(?:后|内))\s*(?:不超过|不少于|不多于|至多)?\s*([0-9]{1,4}|[一二两三四五六七八九十]{1,3})\s*(个?工作日|日历天|天|日|个月|月|年)", search_text)
+        if external:
+            raw_pos = page.text.find("履行")
+            if raw_pos < 0:
+                raw_pos = page.text.find("工期")
+            duration_raw = _sentence(page.text, raw_pos) if raw_pos >= 0 else sentence
+            calculation_status = "工期未量化，需查阅合同引用的招标文件、投标文件或其他外部文件"
+            duration_conclusion = "未明确：按招标文件及投标文件执行（需查阅引用文件）"
+            break
         if placeholder:
             marker = placeholder.group(0)
             raw_pos = page.text.find(placeholder.group(1))
             duration_raw = _sentence(page.text, raw_pos) if raw_pos >= 0 else sentence or marker
             duration_unit = placeholder.group(2)
-            calculation_status = f"工期未量化（{placeholder.group(1)}），无法计算完成日期"
+            bracket_value = _cn_number(placeholder.group(1).strip())
+            if bracket_value is not None:
+                duration_value = bracket_value
+                duration_conclusion = f"{duration_value}{duration_unit}"
+                calculation_status = "缺少可确定的起算日期，暂无法计算"
+            else:
+                calculation_status = f"工期未量化（{placeholder.group(1)}），无法计算完成日期"
+                duration_conclusion = f"未明确：{placeholder.group(1)}"
             break
         if explicit:
             duration_raw = sentence
             duration_value = _cn_number(explicit.group(1))
             duration_unit = explicit.group(2)
             calculation_status = "缺少可确定的起算日期，暂无法计算" if not result.get("工期起算具体日期") else "已具备计算条件"
+            duration_conclusion = f"{duration_value}{duration_unit}" if duration_value is not None else "未明确"
             break
     if not duration_raw and candidates:
         duration_raw = candidates[0][1]
         if "共同确认" in duration_raw or "合理的建设周期" in duration_raw:
             calculation_status = "合同未量化工期，需双方另行确认建设周期"
+            duration_conclusion = "未明确：建设周期需双方另行确认"
 
     start_type = str(result.get("工期起算方式") or "没有明确")
     start_text = str(result.get("工期起算条件原文") or "")
@@ -212,7 +230,7 @@ def _extract_time_plan(project: str, direction: str, pages: list[PageText], resu
     time_evidence = [e.evidence_id for e in evidence if "工期" in e.field_name or "时间" in e.field_name]
     return TimePlan(duration_value, duration_unit, start_type, start_text, start_date, finish_date, "项目完工", None,
                     milestones, time_evidence, .9 if duration_value else .55 if duration_raw else 0.0,
-                    duration_raw, calculation_status, details)
+                    duration_raw, calculation_status, details, duration_conclusion)
 
 
 def _extract_scopes(project: str, direction: str, pages: list[PageText], evidence: list[EvidenceRef]) -> list[ScopeItem]:

@@ -69,6 +69,7 @@ class TimePlan:
     duration_raw: str = ""
     calculation_status: str = ""
     milestone_details: dict[str, dict[str, Any]] = field(default_factory=dict)
+    duration_conclusion: str = ""
 
 
 @dataclass(slots=True)
