@@ -36,6 +36,39 @@ class ReviewSystemTests(unittest.TestCase):
             self.assertTrue(root.exists())
             self.assertTrue(any(getattr(route, "path", "") == "/api/tasks/{task_id}" for route in app.routes))
             self.assertTrue(any(getattr(route, "path", "") == "/api/tasks" for route in app.routes))
+            self.assertTrue(any(getattr(route, "path", "") == "/api/projects/{project_code}" and
+                                "DELETE" in getattr(route, "methods", set()) for route in app.routes))
+
+    def test_delete_project_removes_files_results_and_database_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "contracts"
+            output = Path(tmp) / "results"
+            app = create_app(root, output)
+            service = app.state.service
+            code = "DELETE001"
+            project = root / code
+            (project / "前向").mkdir(parents=True)
+            (project / "后向").mkdir()
+            (project / "前向" / "合同.pdf").touch()
+            detail = output / "项目明细" / code
+            detail.mkdir(parents=True)
+            (detail / "结果.json").touch()
+            cache = output / "ocr_cache" / f"{code}_前向"
+            cache.mkdir(parents=True)
+            service.store.upsert_project(code, str(project), "处理失败", "待确认", {"project_code": code})
+            service.store.save_correction(code, "前向", "contract_name", "人工名称")
+            endpoint = next(route.endpoint for route in app.routes
+                            if getattr(route, "path", "") == "/api/projects/{project_code}"
+                            and "DELETE" in getattr(route, "methods", set()))
+
+            result = endpoint(code)
+
+            self.assertEqual(result["status"], "项目已彻底删除")
+            self.assertFalse(project.exists())
+            self.assertFalse(detail.exists())
+            self.assertFalse(cache.exists())
+            self.assertIsNone(service.store.get_project(code))
+            self.assertEqual(service.store.list_corrections(code), [])
 
     def test_single_project_root_with_multiple_backward_contracts(self):
         with tempfile.TemporaryDirectory() as tmp:

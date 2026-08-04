@@ -177,6 +177,16 @@ class ReviewStore:
             cursor = db.execute("DELETE FROM field_corrections WHERE id=?", (correction_id,))
             return cursor.rowcount == 1
 
+    def delete_project(self, project_code: str) -> dict[str, int]:
+        """Delete every database record owned by one project in one transaction."""
+        tables = ("field_corrections", "review_issues", "contracts", "tasks", "projects")
+        deleted: dict[str, int] = {}
+        with self.connect() as db:
+            for table in tables:
+                cursor = db.execute(f"DELETE FROM {table} WHERE project_code=?", (project_code,))
+                deleted[table] = cursor.rowcount
+        return deleted
+
     def dashboard(self) -> dict[str, int]:
         projects = self.list_projects()
         issues = self.list_issues()

@@ -191,6 +191,55 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
             raise HTTPException(404, "项目不存在或尚未处理")
         return payload
 
+    @app.delete("/api/projects/{project_code}")
+    def delete_project(project_code: str):
+        code = project_code.strip()
+        if not code or len(code) > 100 or re.search(r"[\\/:*?\"<>|]", code) or code in {".", ".."}:
+            raise HTTPException(400, "项目编码无效")
+        running = [task for task in app.state.tasks.values()
+                   if task.get("project_code") == code and task.get("status") in {"排队中", "运行中"}]
+        if running:
+            raise HTTPException(409, "该项目正在解析，完成后才能删除")
+
+        root_resolved = service.contract_root.resolve()
+        single_project_mode = (service.contract_root / "前向").is_dir() or (service.contract_root / "后向").is_dir()
+        project_folder = service.contract_root if single_project_mode and service.contract_root.name == code else service.contract_root / code
+        project_resolved = project_folder.resolve()
+        if project_resolved != root_resolved and root_resolved not in project_resolved.parents:
+            raise HTTPException(400, "项目目录超出合同上传根目录，拒绝删除")
+
+        existed = service.store.get_project(code) is not None or project_folder.exists()
+        if not existed:
+            raise HTTPException(404, "项目不存在")
+
+        removed_paths: list[str] = []
+        if single_project_mode and project_resolved == root_resolved:
+            for name in ("前向", "后向"):
+                target = service.contract_root / name
+                if target.exists():
+                    shutil.rmtree(target)
+                    removed_paths.append(str(target))
+        elif project_folder.exists():
+            shutil.rmtree(project_folder)
+            removed_paths.append(str(project_folder))
+
+        detail = service.output_root / "项目明细" / code
+        if detail.exists():
+            shutil.rmtree(detail)
+            removed_paths.append(str(detail))
+        cache_root = service.output_root / "ocr_cache"
+        for cache in cache_root.glob(f"{code}_*") if cache_root.exists() else []:
+            if cache.is_dir():
+                shutil.rmtree(cache)
+                removed_paths.append(str(cache))
+
+        deleted_records = service.store.delete_project(code)
+        for task_id, task in list(app.state.tasks.items()):
+            if task.get("project_code") == code:
+                del app.state.tasks[task_id]
+        return {"status": "项目已彻底删除", "project_code": code,
+                "removed_paths": removed_paths, "deleted_records": deleted_records}
+
     @app.get("/api/projects/{project_code}/corrections")
     def corrections(project_code: str):
         return service.store.list_corrections(project_code)
