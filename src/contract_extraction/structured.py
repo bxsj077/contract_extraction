@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict
+from datetime import date, timedelta
 from typing import Any
 
 from .models import ContractOutput, PageText
 from .system_models import ContractStructured, EquipmentItem, EvidenceRef, ScopeItem, TimePlan
 
 
-UNITS = "台|套|个|块|只|批|系统|项|组|路|点|端|授权|年|月"
+UNITS = "公斤|千克|千米|立方米|立方|平方米|千块|工作日|日历天|台|套|个|块|只|批|系统|项|组|路|点|端|授权|根|副|米|吨|年|月"
+TABLE_UNIT_PATTERN = "|".join(r"\s*".join(re.escape(char) for char in unit) for unit in UNITS.split("|"))
 EQUIPMENT_RE = re.compile(rf"(?P<name>[\u4e00-\u9fffA-Za-z0-9\-（）()/.]{{2,45}}?)\s+(?:(?P<model>[A-Za-z][A-Za-z0-9._/\-]{{2,30}})\s+)?(?P<unit>{UNITS})\s*(?P<qty>\d+(?:\.\d+)?)")
-EQUIPMENT_WORDS = re.compile(r"交换机|服务器|防火墙|路由器|存储|软件|平台|系统|模块|终端|摄像机|授权|数据库|线缆|光纤|机柜|配电|网关")
+EQUIPMENT_WORDS = re.compile(r"交换机|服务器|防火墙|路由器|存储|软件|平台|系统|模块|终端|摄像机|授权|数据库|线缆|光纤|机柜|配电|网关|钢筋|电缆托架|积水罐|井盖|机制砖|粗砂|碎石|PVC|水泥|混凝土|管材|材料")
+TABLE_HINT_RE = re.compile(r"报价表|报价清单|设备清单|材料清单|工程量清单")
+PROCUREMENT_HINT_RE = re.compile(r"(?:设备|材料|货物).{0,8}采购|采购.{0,8}(?:设备|材料|货物)|设备清单|材料清单|报价清单|明细报价表|主材|辅材|材料由.{0,10}提供")
 SCOPE_TERMS = ["供货", "运输", "卸货", "保管", "上架", "安装", "通电", "设备调试", "系统联调", "旧设备拆除",
                "桥架施工", "管线施工", "线缆敷设", "光纤熔接", "配电施工", "防雷接地", "机房改造", "土建恢复", "标识标签",
                "软件部署", "环境搭建", "功能配置", "接口开发", "系统集成", "数据迁移", "数据治理", "系统测试", "安全加固",
@@ -41,10 +45,61 @@ def _page_evidence(pages: list[PageText], needle: str) -> tuple[str, int, str, f
 def _extract_equipment(project: str, direction: str, pages: list[PageText], evidence: list[EvidenceRef]) -> list[EquipmentItem]:
     items: list[EquipmentItem] = []
     seen: set[tuple[str, str, float | None]] = set()
+    material_table_active = False
+    expected_row = 1
     for page in pages:
+        table_start = bool(TABLE_HINT_RE.search(page.text) and re.search(r"单\s*位", page.text)
+                           and re.search(r"数\s*量", page.text))
+        if table_start:
+            material_table_active = True
+            expected_row = 1
+        processed_table_page = material_table_active
+        if material_table_active:
+            table_text = page.text
+            next_table = re.search(r"序\s*号\s*\n?\s*定额\s*编号|单位定额值|机\s*械\s*名\s*称", table_text)
+            if next_table:
+                table_text = table_text[:next_table.start()]
+            lines = [re.sub(r"\s+", " ", x).strip() for x in table_text.splitlines() if x.strip()]
+            starts: list[tuple[int, int, str]] = []
+            for index, line in enumerate(lines):
+                match = re.match(r"^(\d{1,3})\s+([^\d].*)$", line)
+                if not match and line.isdigit() and index + 1 < len(lines) and re.search(r"[\u4e00-\u9fffA-Za-z]", lines[index + 1]):
+                    match = re.match(r"^(\d{1,3})$", line)
+                if match and int(match.group(1)) == expected_row:
+                    starts.append((index, expected_row, match.group(2) if match.lastindex and match.lastindex >= 2 else ""))
+                    expected_row += 1
+            for row_index, (start, number, first) in enumerate(starts):
+                end = starts[row_index + 1][0] if row_index + 1 < len(starts) else min(len(lines), start + 20)
+                block = first + " " + " ".join(lines[start + 1:end])
+                parsed = re.search(rf"^(?P<name>.{{2,180}}?)(?P<unit>{TABLE_UNIT_PATTERN})\s*"
+                                   rf"(?P<qty>\d+(?:\.\d*)?)(?:\s+(?P<qty_tail>\d{{1,3}})(?![\d.]))?", block)
+                if not parsed:
+                    continue
+                name = re.sub(r"^(序号|编号)", "", parsed.group("name")).strip(" ：:，,;；")
+                name = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])|(?<=[A-Za-z0-9])\s+(?=[A-Za-z0-9])", "", name)
+                if len(name) > 80 or not re.search(r"[\u4e00-\u9fffA-Za-z]", name):
+                    continue
+                qty_text = parsed.group("qty") + (parsed.group("qty_tail") or "")
+                qty = float(qty_text)
+                key = (name, "", qty)
+                if key in seen:
+                    continue
+                seen.add(key)
+                ev_id = f"EV-{project}-{direction}-ITEM-{len(items)+1:04d}"
+                unit = re.sub(r"\s+", "", parsed.group("unit"))
+                quote = f"清单第{number}项：{name}，单位{unit}，数量{qty:g}"
+                evidence.append(EvidenceRef(ev_id, project, direction, "设备材料清单", name, page.file_name, page.page,
+                                            quote, page.method, page.confidence or "", bool(page.confidence and page.confidence < .9)))
+                category = "设备" if EQUIPMENT_WORDS.search(name) and not re.search(r"钢筋|砖|砂|碎石|水泥|混凝土|管", name) else "材料"
+                items.append(EquipmentItem(category, name, name, "", "", unit, qty, {}, direction,
+                                           ev_id, float(page.confidence or .9)))
+            if next_table:
+                material_table_active = False
+        if processed_table_page:
+            continue
         for match in EQUIPMENT_RE.finditer(page.text):
             name = match.group("name").strip(" ：:，,;；")
-            if not EQUIPMENT_WORDS.search(name):
+            if not EQUIPMENT_WORDS.search(name) or re.search(r"项目合同|合同签订|签订地", name):
                 continue
             qty = float(match.group("qty"))
             key = (name, match.group("model") or "", qty)
@@ -58,6 +113,106 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
             items.append(EquipmentItem("其他", name, name, "", match.group("model") or "", match.group("unit"), qty,
                                        {}, direction, ev_id, float(page.confidence or .9)))
     return items
+
+
+def _time_sentence(page: PageText, term: str) -> str:
+    pos = page.text.find(term)
+    return _sentence(page.text, pos) if pos >= 0 else ""
+
+
+def _cn_number(value: str) -> int | None:
+    if value.isdigit():
+        return int(value)
+    digits = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    if value == "十": return 10
+    if "十" in value:
+        left, right = value.split("十", 1)
+        return (digits.get(left, 1) * 10) + digits.get(right, 0)
+    return digits.get(value)
+
+
+def _extract_time_plan(project: str, direction: str, pages: list[PageText], result: dict[str, Any],
+                       evidence: list[EvidenceRef]) -> TimePlan:
+    candidates: list[tuple[PageText, str]] = []
+    for page in pages:
+        for term in ("工期", "建设周期", "实施周期"):
+            if term in page.text:
+                candidates.append((page, _time_sentence(page, term)))
+                break
+    duration_value = None
+    duration_unit = ""
+    duration_raw = ""
+    calculation_status = "合同未约定具体工期"
+    for page, sentence in candidates:
+        normalized_page = re.sub(r"\s+", "", page.text)
+        normalized = re.sub(r"\s+", "", sentence)
+        search_text = normalized_page
+        placeholder = re.search(r"[\[〔【（(]([^\]〕】）)]+)[\]〕】）)]\s*(工作日|日历天|天|日|个月|月|年)", search_text)
+        explicit = re.search(r"(?:工期(?:为|共|：|:)?|周期(?:为|共|：|:)?|应于.{0,30}?(?:后|内))\s*(?:不超过|不少于|不多于|至多)?\s*([0-9]{1,4}|[一二两三四五六七八九十]{1,3})\s*(个?工作日|日历天|天|日|个月|月|年)", search_text)
+        if placeholder:
+            marker = placeholder.group(0)
+            raw_pos = page.text.find(placeholder.group(1))
+            duration_raw = _sentence(page.text, raw_pos) if raw_pos >= 0 else sentence or marker
+            duration_unit = placeholder.group(2)
+            calculation_status = f"工期未量化（{placeholder.group(1)}），无法计算完成日期"
+            break
+        if explicit:
+            duration_raw = sentence
+            duration_value = _cn_number(explicit.group(1))
+            duration_unit = explicit.group(2)
+            calculation_status = "缺少可确定的起算日期，暂无法计算" if not result.get("工期起算具体日期") else "已具备计算条件"
+            break
+    if not duration_raw and candidates:
+        duration_raw = candidates[0][1]
+        if "共同确认" in duration_raw or "合理的建设周期" in duration_raw:
+            calculation_status = "合同未量化工期，需双方另行确认建设周期"
+
+    start_type = str(result.get("工期起算方式") or "没有明确")
+    start_text = str(result.get("工期起算条件原文") or "")
+    joined = "\n".join(p.text for p in pages)
+    if re.search(r"合同(?:签订|签署)(?:后|之日|之日起)", joined):
+        start_type = "合同签订开始"
+        start_text = duration_raw if "合同签" in duration_raw else next((s for _, s in candidates if "合同签" in s), start_text)
+    elif re.search(r"(?:收到|接到).{0,12}开工令", joined):
+        start_type = "收到开工令开始"
+    start_date = str(result.get("工期起算具体日期") or "") or None
+    finish_date = str(result.get("预计结束日期") or "") or None
+    if duration_value is None:
+        finish_date = None
+    if start_date and duration_value and not finish_date and duration_unit in {"日", "天", "工作日", "日历天", "个工作日"}:
+        finish_date = (date.fromisoformat(start_date) + timedelta(days=duration_value)).isoformat()
+        calculation_status = "已计算"
+
+    details: dict[str, dict[str, Any]] = {}
+    milestone_terms = {"到货": ("设备到货", "到货"), "初验": ("初验", "初步验收"), "终验": ("终验", "最终验收", "竣工验收")}
+    milestones: dict[str, str] = {}
+    for name, terms in milestone_terms.items():
+        hit = next(((p, term) for p in pages for term in terms if term in p.text), None)
+        if not hit:
+            details[name] = {"原文": "", "相对期限": "", "计算日期": "", "计算状态": "合同未约定该节点"}
+            continue
+        page, term = hit
+        raw = _time_sentence(page, term)
+        date_match = re.search(r"(20\d{2})[年./-](\d{1,2})[月./-](\d{1,2})日?", raw)
+        relative = re.search(r"(?:后|之日起|收到.{0,15}后)\s*([0-9一二两三四五六七八九十]+)\s*(个?工作日|日历天|天|日|个月|月)", raw)
+        calculated = ""
+        if date_match:
+            calculated = f"{int(date_match.group(1)):04d}-{int(date_match.group(2)):02d}-{int(date_match.group(3)):02d}"
+            status = "合同约定了明确日期"
+        elif relative:
+            status = "有相对期限，但缺少可确定的基准日期"
+        else:
+            status = "合同提及该节点，但未明确时间"
+        details[name] = {"原文": raw, "相对期限": relative.group(0) if relative else "", "计算日期": calculated, "计算状态": status}
+        if calculated:
+            milestones[name] = calculated
+        ev_id = f"EV-{project}-{direction}-TIME-{name}"
+        evidence.append(EvidenceRef(ev_id, project, direction, f"{name}时间节点", calculated or status, page.file_name,
+                                    page.page, raw, page.method, page.confidence or "", not bool(calculated)))
+    time_evidence = [e.evidence_id for e in evidence if "工期" in e.field_name or "时间" in e.field_name]
+    return TimePlan(duration_value, duration_unit, start_type, start_text, start_date, finish_date, "项目完工", None,
+                    milestones, time_evidence, .9 if duration_value else .55 if duration_raw else 0.0,
+                    duration_raw, calculation_status, details)
 
 
 def _extract_scopes(project: str, direction: str, pages: list[PageText], evidence: list[EvidenceRef]) -> list[ScopeItem]:
@@ -86,20 +241,23 @@ def analysis_to_structured(project: str, direction: str, output: ContractOutput)
             item.value, item.source_file, item.page, item.quote, item.method, item.ocr_confidence, item.needs_review == "是"))
     equipment = _extract_equipment(project, direction, output.pages, evidence)
     scopes = _extract_scopes(project, direction, output.pages, evidence)
-    milestones = {name: str(result.get(field, "")) for name, field in MILESTONE_MAP.items() if result.get(field)}
-    time_evidence = [e.evidence_id for e in evidence if "工期" in e.field_name or "时间" in e.field_name]
-    plan = TimePlan(int(result["工期数值"]) if result.get("工期数值") else None, str(result.get("工期单位", "")),
-                    str(result.get("工期起算方式", "没有明确")), str(result.get("工期起算条件原文", "")),
-                    str(result.get("工期起算具体日期") or "") or None, str(result.get("预计结束日期") or "") or None,
-                    "项目完工", None, milestones, time_evidence, .9 if result.get("工期数值") else 0.0)
+    plan = _extract_time_plan(project, direction, output.pages, result, evidence)
     kind = str(result.get("合同性质") or "无法确定")
-    return ContractStructured(project, direction, str(result.get("合同号", "")), str(result.get("合同名称", "")),
+    procurement_hit = any(PROCUREMENT_HINT_RE.search(page.text) for page in output.pages)
+    if equipment:
+        procurement_involved, procurement_note = True, f"涉及设备/材料采购，已提取{len(equipment)}项清单内容"
+    elif procurement_hit:
+        procurement_involved, procurement_note = True, "合同提及设备/材料采购或报价清单，但未可靠提取到明细，需人工复核"
+    else:
+        procurement_involved, procurement_note = False, "合同正文未发现货物采购或设备材料清单，按不涉及货物采购标注"
+    contract = ContractStructured(project, direction, str(result.get("合同号", "")), str(result.get("合同名称", "")),
         str(result.get("甲方", "")), str(result.get("乙方", "")), None,
         str(result.get("合同签约日期") or "") or None, None, kind, equipment, plan, scopes,
         {"服务内容": str(result.get("服务内容", "")), "乙方义务": str(result.get("乙方义务", "")),
          "关键条款": str(result.get("关键条款", ""))}, evidence,
         {"file_hash": output.fingerprint, "source_files": output.source_files, "parse_version": "2026.08-v1"},
-        [str(result.get("复核原因"))] if result.get("待人工复核") == "是" else [])
+        [str(result.get("复核原因"))] if result.get("待人工复核") == "是" else [], procurement_involved, procurement_note)
+    return contract
 
 
 def structured_to_dict(value: ContractStructured) -> dict[str, Any]:
@@ -114,4 +272,5 @@ def structured_from_dict(data: dict[str, Any]) -> ContractStructured:
         equipment=[EquipmentItem(**x) for x in data.get("equipment", [])], time_plan=TimePlan(**data.get("time_plan", {})),
         scopes=[ScopeItem(**x) for x in data.get("scopes", [])], key_clauses=data.get("key_clauses", {}),
         evidence=[EvidenceRef(**x) for x in data.get("evidence", [])], parse_metadata=data.get("parse_metadata", {}),
-        review_issues=data.get("review_issues", []))
+        review_issues=data.get("review_issues", []), procurement_involved=data.get("procurement_involved"),
+        procurement_note=data.get("procurement_note", ""))

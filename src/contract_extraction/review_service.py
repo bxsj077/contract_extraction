@@ -19,7 +19,7 @@ from .system_models import ContractStructured, ProjectFiles, ProjectReviewResult
 
 
 LOGGER = logging.getLogger("contract_review")
-PARSE_VERSION = "2026.08-v2-multi-backward"
+PARSE_VERSION = "2026.08-v5-time-equipment-status"
 
 
 def _bundle_hash(paths: list[str]) -> str:
@@ -43,6 +43,14 @@ class ReviewService:
         self.config = load_config(config_path)
         self.store = ReviewStore(output_root / "contract_review.db")
         self.ocr = LocalOcr()
+        log_dir = output_root / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = (log_dir / "contract_review.log").resolve()
+        if not any(isinstance(h, logging.FileHandler) and Path(h.baseFilename).resolve() == log_path for h in LOGGER.handlers):
+            handler = logging.FileHandler(log_path, encoding="utf-8", delay=True)
+            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            LOGGER.addHandler(handler)
+            LOGGER.setLevel(logging.INFO)
 
     def _parse_bundle(self, project: ProjectFiles, direction: str, paths: list[str], cache_key: str,
                       output_name: str, force: bool) -> ContractStructured | None:
@@ -55,15 +63,22 @@ class ReviewService:
         pages = []; sources = []; errors = []
         for path in paths:
             pdf = Path(path)
-            file_pages, source, file_errors = extract_pdf_pages(pdf, f"{project.project_code}_{cache_key}",
+            LOGGER.info("开始解析 %s合同：%s", direction, pdf)
+            safe_cache_id = _safe_name(f"{project.project_code}_{cache_key}")
+            file_pages, source, file_errors = extract_pdf_pages(pdf, safe_cache_id,
                 self.output_root / "ocr_cache", self.ocr, int(self.config.get("ocr_dpi", 300)),
                 int(self.config.get("signature_dpi", 600)), int(self.config.get("native_text_min_chars", 80)),
                 int(self.config.get("native_text_min_cjk", 20)), force)
             pages.extend(file_pages); sources.append(source); errors.extend(file_errors)
+            LOGGER.info("完成读取 %s：%s页，OCR错误%s项", pdf.name, source.get("页数", 0), len(file_errors))
         analysis = analyze_contract(f"{project.project_code}-{direction}", project.folder, pages, sources,
                                     fingerprint, self.config, errors)
         structured = analysis_to_structured(project.project_code, direction, analysis)
         structured.parse_metadata["bundle_files"] = paths
+        structured.parse_metadata.update({"file_count": len(paths), "page_count": len(pages), "ocr_error_count": len(errors),
+                                          "errors": errors, "parse_status": "完整" if not errors else "部分完成"})
+        if errors:
+            structured.review_issues.append(f"存在{len(errors)}项页面读取或OCR错误，解析结果需复核")
         payload = structured_to_dict(structured)
         self.store.save_contract(project.project_code, cache_key, fingerprint, PARSE_VERSION, payload)
         detail = self.output_root / "项目明细" / project.project_code
@@ -93,9 +108,12 @@ class ReviewService:
                     equipment[key] = deepcopy(item)
                 elif item.quantity is not None:
                     current = equipment[key]
-                    current.quantity = (current.quantity or 0) + item.quantity
+                    current.quantity = round((current.quantity or 0) + item.quantity, 6)
                     current.evidence_id = ";".join(x for x in (current.evidence_id, item.evidence_id) if x)
         aggregate.equipment = list(equipment.values())
+        involved = [c.procurement_involved for c in contracts]
+        aggregate.procurement_involved = True if True in involved else (False if involved and all(x is False for x in involved) else None)
+        aggregate.procurement_note = "；".join(f"{c.contract_name or i + 1}：{c.procurement_note}" for i, c in enumerate(contracts))
 
         scopes = {}
         for contract in contracts:
@@ -111,16 +129,30 @@ class ReviewService:
         durations = [p.duration_value for p in plans if p.duration_value is not None]
         conditions = {p.start_condition_type for p in plans}
         milestones: dict[str, str] = {}
+        milestone_details: dict[str, dict[str, object]] = {}
         for plan in plans:
             for name, value in plan.milestones.items():
                 if value and (name not in milestones or value > milestones[name]):
                     milestones[name] = value
-        aggregate.time_plan = TimePlan(max(durations) if durations else None,
-            next((p.duration_unit for p in plans if p.duration_unit), ""),
-            conditions.pop() if len(conditions) == 1 else "多个后向合同起算条件不一致",
-            "；".join(p.start_condition_text for p in plans if p.start_condition_text), min(starts) if starts else None,
-            max(finishes) if finishes else None, "全部后向合同完成", None, milestones,
-            [x for p in plans for x in p.evidence_ids], min((p.confidence for p in plans), default=0.0))
+        for node in ("到货", "初验", "终验"):
+            node_values = [p.milestone_details.get(node, {}) for p in plans]
+            statuses = list(dict.fromkeys(str(x.get("计算状态", "未提取")) for x in node_values))
+            milestone_details[node] = {"原文": "；".join(str(x.get("原文", "")) for x in node_values if x.get("原文")),
+                "相对期限": "；".join(str(x.get("相对期限", "")) for x in node_values if x.get("相对期限")),
+                "计算日期": max((str(x.get("计算日期")) for x in node_values if x.get("计算日期")), default=""),
+                "计算状态": statuses[0] if len(statuses) == 1 else "多份后向合同节点约定不一致：" + "；".join(statuses)}
+        calc_statuses = list(dict.fromkeys(p.calculation_status for p in plans if p.calculation_status))
+        aggregate.time_plan = TimePlan(duration_value=max(durations) if durations else None,
+            duration_unit=next((p.duration_unit for p in plans if p.duration_unit), ""),
+            start_condition_type=conditions.pop() if len(conditions) == 1 else "多个后向合同起算条件不一致",
+            start_condition_text="；".join(p.start_condition_text for p in plans if p.start_condition_text),
+            start_date=min(starts) if starts else None, finish_date=max(finishes) if finishes else None,
+            completion_node="全部后向合同完成", milestones=milestones,
+            evidence_ids=[x for p in plans for x in p.evidence_ids],
+            confidence=min((p.confidence for p in plans), default=0.0),
+            duration_raw="；".join(dict.fromkeys(p.duration_raw for p in plans if p.duration_raw)),
+            calculation_status=calc_statuses[0] if len(calc_statuses) == 1 else "；".join(calc_statuses),
+            milestone_details=milestone_details)
         aggregate.sign_date = max((c.sign_date for c in contracts if c.sign_date), default=None)
         aggregate.parse_metadata = {"aggregation": "multiple_backward_contracts", "contract_count": len(contracts),
                                     "source_contracts": [c.parse_metadata for c in contracts]}
@@ -139,7 +171,12 @@ class ReviewService:
 
     def process_project(self, project: ProjectFiles, force: bool = False) -> ProjectReviewResult:
         now = datetime.now().isoformat(timespec="seconds")
+        LOGGER.info("项目%s开始处理：前向%s份，后向%s份", project.project_code, len(project.forward_pdfs), len(project.backward_pdfs))
         try:
+            detail = self.output_root / "项目明细" / project.project_code
+            detail.mkdir(parents=True, exist_ok=True)
+            for stale in detail.glob("后向合同_*_解析结果.json"):
+                stale.unlink(missing_ok=True)
             forward = self._parse_bundle(project, "前向", project.forward_pdfs, "前向", "前向合同解析结果", force)
             backward_contracts = []
             for index, path in enumerate(project.backward_pdfs, 1):
@@ -158,7 +195,8 @@ class ReviewService:
                     scopes = compare_scopes(forward, backward)
                 else:
                     project.issues.append("存在运维类合同，暂不执行设备、工期和实施内容三项核心对比")
-                status = "已完成"
+                parsed_contracts = ([forward] if forward else []) + backward_contracts
+                status = "部分完成" if any(c.parse_metadata.get("parse_status") != "完整" for c in parsed_contracts) else "已完成"
             else:
                 status = "仅完成单向解析" if forward or backward else "处理失败"
             all_diffs = equipment + schedule + scopes
@@ -167,9 +205,17 @@ class ReviewService:
             for contract in ([forward] if forward else []) + backward_contracts:
                 review_issues.extend({"category": f"{contract.direction}合同解析", "description": issue} for issue in contract.review_issues if issue)
             review_issues.extend({"category": d.category, "description": f"{d.title}：{d.description}"} for d in all_diffs if d.needs_review)
+            parse_statuses = []
+            for contract in ([forward] if forward else []) + backward_contracts:
+                meta = contract.parse_metadata
+                parse_statuses.append({"合同方向": contract.direction, "合同名称": contract.contract_name,
+                    "源文件": "；".join(Path(x).name for x in meta.get("bundle_files", [])),
+                    "文件数": meta.get("file_count", 0), "页数": meta.get("page_count", 0),
+                    "OCR错误数": meta.get("ocr_error_count", 0), "解析状态": meta.get("parse_status", "未知"),
+                    "设备材料清单项数": len(contract.equipment), "采购备注": contract.procurement_note})
             result = ProjectReviewResult(project.project_code, status, risk, forward, backward, equipment, schedule, scopes,
                                          self._timeline(forward, backward), review_issues, processed_at=now,
-                                         backward_contracts=backward_contracts)
+                                         backward_contracts=backward_contracts, contract_parse_statuses=parse_statuses)
         except Exception as exc:
             LOGGER.exception("项目%s处理失败", project.project_code)
             result = ProjectReviewResult(project.project_code, "处理失败", "待确认", None, None,
@@ -180,6 +226,7 @@ class ReviewService:
         detail = self.output_root / "项目明细" / project.project_code
         detail.mkdir(parents=True, exist_ok=True)
         (detail / "前后向审查结果.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        LOGGER.info("项目%s处理结束：%s，风险%s", project.project_code, result.status, result.risk_level)
         return result
 
     def run(self, wanted: set[str] | None = None, force: bool = False) -> dict[str, object]:

@@ -66,6 +66,9 @@ class TimePlan:
     milestones: dict[str, str] = field(default_factory=dict)
     evidence_ids: list[str] = field(default_factory=list)
     confidence: float = 0.0
+    duration_raw: str = ""
+    calculation_status: str = ""
+    milestone_details: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -100,6 +103,8 @@ class ContractStructured:
     evidence: list[EvidenceRef] = field(default_factory=list)
     parse_metadata: dict[str, Any] = field(default_factory=dict)
     review_issues: list[str] = field(default_factory=list)
+    procurement_involved: bool | None = None
+    procurement_note: str = ""
 
 
 @dataclass(slots=True)
@@ -131,6 +136,7 @@ class ProjectReviewResult:
     rule_version: str = "2026.08-v1"
     processed_at: str = ""
     backward_contracts: list[ContractStructured] = field(default_factory=list)
+    contract_parse_statuses: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

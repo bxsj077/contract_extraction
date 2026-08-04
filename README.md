@@ -144,3 +144,11 @@ contract-extract --input "C:\path\合同根目录" --output "C:\path\输出目�
 python -m unittest discover -s tests -v
 python -m compileall src scripts
 ```
+# 查看后台运行状态
+
+网页的“最近处理任务”会持续显示任务状态，任务记录保存在 SQLite 中，服务重启后仍可查询。PowerShell 也可直接查看：
+
+```powershell
+python scripts/check_status.py --output "C:\Users\keyan\Documents\contract_extraction\data\review_output" --project JSNJA2513970CGN00
+Get-Content "C:\Users\keyan\Documents\contract_extraction\data\review_output\logs\contract_review.log" -Wait
+```

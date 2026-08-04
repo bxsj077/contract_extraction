@@ -31,25 +31,33 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
     app.state.service = service
     app.state.tasks = {}
 
+    def update_task(task_id: str, **values) -> dict:
+        task = app.state.tasks.get(task_id) or service.store.get_task(task_id) or {"task_id": task_id}
+        task.update(values)
+        app.state.tasks[task_id] = task
+        service.store.save_task(task)
+        return task
+
     def run_review_task(task_id: str, code: str, overwrite: bool) -> None:
         task = app.state.tasks[task_id]
         try:
-            task.update(status="运行中", stage="正在枚举前向及后向合同", progress=20,
-                        started_at=datetime.now().isoformat(timespec="seconds"))
+            task = update_task(task_id, status="运行中", stage="正在枚举前向及后向合同", progress=20,
+                               started_at=datetime.now().isoformat(timespec="seconds"))
             found = scan_projects(service.contract_root, {code})
             if not found:
                 raise RuntimeError("上传目录中未找到该项目")
-            task.update(stage=f"正在执行OCR解析和履约风险审查（前向{len(found[0].forward_pdfs)}份、后向{len(found[0].backward_pdfs)}份）",
-                        progress=45)
+            task = update_task(task_id, stage=f"正在逐份执行OCR解析和履约风险审查（前向{len(found[0].forward_pdfs)}份、后向{len(found[0].backward_pdfs)}份）",
+                               progress=45, forward_count=len(found[0].forward_pdfs), backward_count=len(found[0].backward_pdfs))
             result = service.process_project(found[0], force=overwrite)
             if result.status == "处理失败":
                 detail = "；".join(x.get("description", "") for x in result.review_issues) or "项目处理失败"
                 raise RuntimeError(detail)
-            task.update(status="已完成", stage="解析和审查已完成", progress=100, result=result.to_dict(),
-                        risk_level=result.risk_level, completed_at=datetime.now().isoformat(timespec="seconds"),
+            update_task(task_id, status=result.status, stage="解析和审查已完成" if result.status == "已完成" else "解析完成但存在页面错误，请查看合同解析状态",
+                        progress=100, result=result.to_dict(), risk_level=result.risk_level,
+                        completed_at=datetime.now().isoformat(timespec="seconds"),
                         result_directory=str(service.output_root / "项目明细" / code))
         except Exception as exc:
-            task.update(status="失败", stage="处理失败", progress=100, error=str(exc),
+            update_task(task_id, status="失败", stage="处理失败", progress=100, error=str(exc),
                         completed_at=datetime.now().isoformat(timespec="seconds"))
 
     @app.get("/", response_class=HTMLResponse)
@@ -64,17 +72,18 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
     def config():
         return {"合同上传根目录": str(service.contract_root), "审查结果目录": str(service.output_root),
                 "项目数据库": str(service.store.path),
+                "后台运行日志": str(service.output_root / "logs" / "contract_review.log"),
                 "目录格式": "<根目录>/<前向合同编号>/前向/*.pdf、后向/*.pdf；根目录也可直接指向单个合同编号目录"}
 
     @app.get("/api/tasks")
     def task_list():
-        return sorted(app.state.tasks.values(), key=lambda item: item.get("created_at", ""), reverse=True)[:20]
+        return service.store.list_tasks(20)
 
     @app.get("/api/tasks/{task_id}")
     def task_status(task_id: str):
-        task = app.state.tasks.get(task_id)
+        task = app.state.tasks.get(task_id) or service.store.get_task(task_id)
         if not task:
-            raise HTTPException(404, "任务不存在，服务可能已经重启")
+            raise HTTPException(404, "任务不存在")
         return task
 
     async def save_pdf(upload: UploadFile, target: Path) -> None:
@@ -137,9 +146,9 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
                    "后向合同": backward_paths, "后向合同数量": len(backward_paths), "处理状态": "已上传"}
         if process_now:
             task_id = uuid.uuid4().hex
-            app.state.tasks[task_id] = {"task_id": task_id, "project_code": code, "status": "排队中",
-                "stage": "合同文件已保存，等待开始", "progress": 10,
-                "created_at": datetime.now().isoformat(timespec="seconds")}
+            update_task(task_id, project_code=code, status="排队中",
+                        stage="合同文件已保存，等待开始", progress=10,
+                        created_at=datetime.now().isoformat(timespec="seconds"))
             background_tasks.add_task(run_review_task, task_id, code, overwrite)
             payload.update({"处理状态": "后台处理中", "task_id": task_id,
                             "任务查询地址": f"/api/tasks/{task_id}"})

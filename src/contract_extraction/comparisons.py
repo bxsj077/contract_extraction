@@ -24,6 +24,12 @@ def _item_score(forward, backward) -> float:
 
 def compare_equipment(forward: ContractStructured, backward: ContractStructured) -> list[Difference]:
     results: list[Difference] = []
+    if not forward.equipment and not backward.equipment:
+        if forward.procurement_involved is False and backward.procurement_involved is False:
+            return [Difference("设备材料", "双方均不涉及货物采购", "无风险", "EQ-000", "货物采购适用性",
+                f"前向：{forward.procurement_note}；后向：{backward.procurement_note}")]
+        return [Difference("设备材料", "未提取到清单", "待确认", "EQ-000", "货物采购适用性",
+            f"前向：{forward.procurement_note}；后向：{backward.procurement_note}", needs_review=True)]
     matched: set[int] = set()
     for f in forward.equipment:
         choices = sorted(((i, _item_score(f, b)) for i, b in enumerate(backward.equipment)), key=lambda x: x[1], reverse=True)
@@ -55,9 +61,16 @@ def compare_schedule(forward: ContractStructured, backward: ContractStructured, 
     f, b = forward.time_plan, backward.time_plan
     evidence = f.evidence_ids + b.evidence_ids
     if not all((f.start_date, f.duration_value, b.start_date, b.duration_value, f.finish_date, b.finish_date)):
-        return [Difference("工期", "缺少起算依据", "待确认", "TM-001", "工期衔接",
-            "缺少前向或后向实际起算日期、工期或可计算完成日期，暂无法判断工期满足。",
+        result = [Difference("工期", "缺少起算依据", "待确认", "TM-001", "工期衔接",
+            f"前向：{f.calculation_status or '缺少可计算信息'}；后向：{b.calculation_status or '缺少可计算信息'}。",
             asdict(f), asdict(b), evidence, True)]
+        for node in ("到货", "初验", "终验"):
+            fd = f.milestone_details.get(node, {})
+            bd = b.milestone_details.get(node, {})
+            result.append(Difference("时间节点", "节点时间待确认", "待确认", f"TM-{node}", node,
+                f"前向：{fd.get('计算状态', '未提取')}；后向：{bd.get('计算状态', '未提取')}。",
+                fd, bd, evidence, True))
+        return result
     f_finish, b_finish = date.fromisoformat(f.finish_date), date.fromisoformat(b.finish_date)
     control = f_finish - timedelta(days=buffer_days)
     if b_finish <= control:

@@ -31,6 +31,11 @@ CREATE TABLE IF NOT EXISTS mappings (
   mapping_type TEXT NOT NULL, source_value TEXT NOT NULL, standard_value TEXT NOT NULL,
   updated_at TEXT NOT NULL, PRIMARY KEY(mapping_type, source_value)
 );
+CREATE TABLE IF NOT EXISTS tasks (
+  task_id TEXT PRIMARY KEY, project_code TEXT NOT NULL, status TEXT NOT NULL,
+  stage TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0, payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
 """
 
 
@@ -101,6 +106,26 @@ class ReviewStore:
             cursor = db.execute("UPDATE review_issues SET status='已复核',resolution=?,resolved_at=? WHERE id=?",
                                 (resolution, datetime.now().isoformat(timespec="seconds"), issue_id))
             return cursor.rowcount == 1
+
+    def save_task(self, task: dict[str, Any]) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        created = str(task.get("created_at") or now)
+        with self.connect() as db:
+            db.execute("""INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(task_id) DO UPDATE SET status=excluded.status,stage=excluded.stage,
+                progress=excluded.progress,payload_json=excluded.payload_json,updated_at=excluded.updated_at""",
+                (task["task_id"], task.get("project_code", ""), task.get("status", ""), task.get("stage", ""),
+                 int(task.get("progress", 0)), json.dumps(task, ensure_ascii=False), created, now))
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT payload_json FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def list_tasks(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute("SELECT payload_json FROM tasks ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
+        return [json.loads(row[0]) for row in rows]
 
     def dashboard(self) -> dict[str, int]:
         projects = self.list_projects()
