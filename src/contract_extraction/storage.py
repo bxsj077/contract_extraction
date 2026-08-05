@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
+from dataclasses import asdict, is_dataclass
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -43,7 +45,29 @@ CREATE TABLE IF NOT EXISTS field_corrections (
   note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   UNIQUE(project_code, contract_key, field_path)
 );
+CREATE TABLE IF NOT EXISTS dismissed_findings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, project_code TEXT NOT NULL,
+  category TEXT NOT NULL, finding_key TEXT NOT NULL, payload_json TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+  UNIQUE(project_code, category, finding_key)
+);
 """
+
+
+def finding_key(category: str, finding: Any) -> str:
+    """Return a stable semantic key for a review finding across recalculations."""
+    payload = asdict(finding) if is_dataclass(finding) else dict(finding)
+    forward = payload.get("forward") or {}
+    identity = {
+        "category": category,
+        "rule_id": payload.get("rule_id", ""),
+        "title": payload.get("title", ""),
+        "standard_name": forward.get("standard_name", ""),
+        "brand": forward.get("brand", ""),
+        "model": forward.get("model", ""),
+    }
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 class ReviewStore:
@@ -177,9 +201,30 @@ class ReviewStore:
             cursor = db.execute("DELETE FROM field_corrections WHERE id=?", (correction_id,))
             return cursor.rowcount == 1
 
+    def dismiss_finding(self, project_code: str, category: str, finding: Any, note: str = "") -> dict[str, Any]:
+        now = datetime.now().isoformat(timespec="seconds")
+        payload = asdict(finding) if is_dataclass(finding) else dict(finding)
+        key = finding_key(category, payload)
+        with self.connect() as db:
+            db.execute("""INSERT INTO dismissed_findings(project_code,category,finding_key,payload_json,note,created_at)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(project_code,category,finding_key) DO UPDATE SET
+                payload_json=excluded.payload_json,note=excluded.note""",
+                (project_code, category, key, json.dumps(payload, ensure_ascii=False), note, now))
+        return {"project_code": project_code, "category": category, "finding_key": key,
+                "finding": payload, "note": note, "created_at": now}
+
+    def dismissed_finding_keys(self, project_code: str, category: str | None = None) -> set[str]:
+        query = "SELECT finding_key FROM dismissed_findings WHERE project_code=?"
+        args: tuple[Any, ...] = (project_code,)
+        if category:
+            query += " AND category=?"
+            args = (project_code, category)
+        with self.connect() as db:
+            return {row[0] for row in db.execute(query, args).fetchall()}
+
     def delete_project(self, project_code: str) -> dict[str, int]:
         """Delete every database record owned by one project in one transaction."""
-        tables = ("field_corrections", "review_issues", "contracts", "tasks", "projects")
+        tables = ("dismissed_findings", "field_corrections", "review_issues", "contracts", "tasks", "projects")
         deleted: dict[str, int] = {}
         with self.connect() as db:
             for table in tables:

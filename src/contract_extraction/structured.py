@@ -14,6 +14,22 @@ TABLE_UNIT_PATTERN = "|".join(r"\s*".join(re.escape(char) for char in unit) for 
 EQUIPMENT_RE = re.compile(rf"(?P<name>[\u4e00-\u9fffA-Za-z0-9\-（）()/.]{{2,45}}?)\s+(?:(?P<model>[A-Za-z][A-Za-z0-9._/\-]{{2,30}})\s+)?(?P<unit>{UNITS})\s*(?P<qty>\d+(?:\.\d+)?)")
 EQUIPMENT_WORDS = re.compile(r"交换机|服务器|防火墙|路由器|存储|软件|平台|系统|模块|终端|摄像机|授权|数据库|线缆|光纤|机柜|配电|网关|钢筋|电缆托架|积水罐|井盖|机制砖|粗砂|碎石|PVC|水泥|混凝土|管材|材料")
 TABLE_HINT_RE = re.compile(r"报价表|报价清单|设备清单|材料清单|工程量清单")
+PROCUREMENT_TABLE_HEADER_RE = re.compile(
+    r"序\s*号.{0,30}名\s*称.{0,30}品\s*牌.{0,60}(?:型\s*号|软件版本号).{0,60}数\s*量",
+    re.S,
+)
+DESCRIPTIVE_PROCUREMENT_HEADER_RE = re.compile(
+    r"序\s*号.{0,30}采购\s*内容.{0,30}技术\s*参数.{0,30}数\s*量.{0,20}单\s*位",
+    re.S,
+)
+PRICE_TABLE_HEADER_RE = re.compile(
+    r"品\s*牌.{0,20}型\s*号.{0,30}不含税单价.{0,30}增值税税\s*率.{0,30}含税单价",
+    re.S,
+)
+QUANTITY_FIRST_TABLE_HEADER_RE = re.compile(
+    r"序\s*号.{0,30}名\s*称.{0,30}数\s*量.{0,20}单\s*位.{0,30}品\s*牌.{0,20}型\s*号",
+    re.S,
+)
 PROCUREMENT_HINT_RE = re.compile(r"(?:设备|材料|货物).{0,8}采购|采购.{0,8}(?:设备|材料|货物)|设备清单|材料清单|报价清单|明细报价表|主材|辅材|材料由.{0,10}提供")
 SCOPE_TERMS = ["供货", "运输", "卸货", "保管", "上架", "安装", "通电", "设备调试", "系统联调", "旧设备拆除",
                "桥架施工", "管线施工", "线缆敷设", "光纤熔接", "配电施工", "防雷接地", "机房改造", "土建恢复", "标识标签",
@@ -42,9 +58,454 @@ def _page_evidence(pages: list[PageText], needle: str) -> tuple[str, int, str, f
     return "", "", "", 0.0
 
 
+def _clean_table_text(value: str) -> str:
+    value = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", value)
+    value = re.sub(r"\s*([/\-])\s*", r"\1", value)
+    value = re.sub(r"(?<=\d)\s+(?=\d)", "", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _split_procurement_columns(body: str) -> tuple[str, str, str]:
+    tokens = body.split()
+    if len(tokens) >= 3 and tokens[-2:] == ["/", "/"]:
+        return _clean_table_text(" ".join(tokens[:-2])), "/", "/"
+    if len(tokens) >= 3 and tokens[-1] in {"定制", "/"}:
+        brand_start = len(tokens) - 2
+        if len(tokens) >= 4 and tokens[-3:-1] == ["中电", "鸿信"]:
+            brand_start -= 1
+        return (_clean_table_text(" ".join(tokens[:brand_start])),
+                _clean_table_text("".join(tokens[brand_start:-1])),
+                tokens[-1])
+    model_index = next((index for index, token in enumerate(tokens[1:], 1)
+                        if len(token) >= 4 and (re.search(r"[-_/]", token)
+                                                or re.search(r"[A-Za-z]", token) and re.search(r"\d", token)
+                                                or re.fullmatch(r"[A-Za-z]{6,}", token))), None)
+    if model_index is None or model_index < 2:
+        return _clean_table_text(body), "", ""
+    return (_clean_table_text(" ".join(tokens[:model_index - 1])),
+            _clean_table_text(tokens[model_index - 1]),
+            _clean_table_text(" ".join(tokens[model_index:])))
+
+
+def _procurement_rows(text: str, initial_section: str = "") -> tuple[list[dict[str, Any]], str]:
+    """Parse repeated/cross-page product tables whose quantity is written as '73 台'."""
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
+    current_section = initial_section
+    starts: list[tuple[int, int, str, str]] = []
+    product_units = "台|套|个|块|只|批|系统|项|组|路|点|端|授权|根|副"
+    for index, line in enumerate(lines):
+        if re.fullmatch(r".{2,50}(?:卷烟厂|有限责任公司|有限公司)", line):
+            current_section = line
+        match = re.match(r"^(\d{1,3})\s+(.+)$", line)
+        if match and not re.match(rf"^(?:{product_units})(?:\s|$|[（(])", match.group(2)):
+            starts.append((index, int(match.group(1)), match.group(2), current_section))
+        elif (line.isdigit() and index + 1 < len(lines)
+              and re.search(r"[\u4e00-\u9fffA-Za-z]", lines[index + 1])
+              and not re.match(r"序\s*号", lines[index + 1])
+              and not re.fullmatch(r".{2,50}(?:卷烟厂|有限责任公司|有限公司)", lines[index + 1])):
+            starts.append((index, int(line), "", current_section))
+    rows: list[dict[str, Any]] = []
+    for row_index, (start, number, first, section) in enumerate(starts):
+        end = starts[row_index + 1][0] if row_index + 1 < len(starts) else min(len(lines), start + 18)
+        block = re.sub(r"\s+", " ", (first + " " + " ".join(lines[start + 1:end])).strip())
+        quantity = re.search(rf"(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>{product_units})(?:\s*[（(][^）)]{{1,30}}[）)])?", block)
+        if not quantity:
+            continue
+        body = block[:quantity.start()].strip(" ：:，,;；")
+        if not re.search(r"[\u4e00-\u9fffA-Za-z]", body):
+            continue
+        name, brand, model = _split_procurement_columns(body)
+        if not name or len(name) > 100:
+            continue
+        rows.append({"row_number": number, "section": section, "name": name, "brand": brand, "model": model,
+                     "quantity": float(quantity.group("qty")), "unit": quantity.group("unit")})
+    return rows, current_section
+
+
+def _cross_page_product_rows(
+        pages: list[PageText]) -> tuple[list[dict[str, Any]], set[tuple[str, int]]]:
+    """Extend 产品名称/品牌/规格型号/数量/单位 tables onto pages without a repeated header."""
+    rows: list[dict[str, Any]] = []
+    consumed: set[tuple[str, int]] = set()
+    active = False
+    current_file = ""
+    expected_row = 1
+    section = ""
+    product_header_re = re.compile(
+        r"序\s*号.{0,30}产品\s*名称.{0,30}品\s*牌.{0,40}规格\s*型号.{0,40}数\s*量.{0,20}单\s*位",
+        re.S,
+    )
+    for page in pages:
+        if page.file_name != current_file:
+            current_file = page.file_name
+            active = False
+            expected_row = 1
+            section = ""
+        has_header = bool(product_header_re.search(page.text))
+        if has_header:
+            active = True
+            expected_row = 1
+        if not active:
+            continue
+        page_rows, section = _procurement_rows(page.text, section)
+        if not page_rows:
+            if re.search(r"以上合计|设备部分合计|总\s*计", page.text):
+                active = False
+            continue
+        if not has_header and page_rows[0]["row_number"] != expected_row:
+            active = False
+            continue
+        consumed.add((page.file_name, page.page))
+        for row in page_rows:
+            rows.append({**row, "page": page})
+        expected_row = page_rows[-1]["row_number"] + 1
+        if re.search(r"以上合计|设备部分合计|总\s*计", page.text):
+            active = False
+    return rows, consumed
+
+
+def _descriptive_name_and_parameters(first: str, following: list[str]) -> tuple[str, str]:
+    """Split a descriptive procurement row into its short name and long specification."""
+    first = re.sub(r"\s+", " ", first).strip()
+    inline_parameter = ""
+    inline = re.match(r"^(?P<name>[^\s，,；;：:]{2,40})\s+(?P<parameter>.+[，,；;。])$", first)
+    if inline:
+        first = inline.group("name")
+        inline_parameter = inline.group("parameter")
+    name_parts = [first]
+    used = 0
+    for line in following[:2]:
+        candidate = re.sub(r"\s+", " ", line).strip()
+        if (not candidate or len(candidate) > 14 or re.match(r"^[（(【\[]?\d+[.、)]", candidate)
+                or re.search(r"[：:；;，,。]", candidate) or "详见" in candidate):
+            break
+        name_parts.append(candidate)
+        used += 1
+        if re.search(r"设备\d*$|装置$|套装$|模块$|授权$|服务$|传感器(?:（[^）]+）)?$|监测仪$", candidate):
+            break
+    parameters = ([inline_parameter] if inline_parameter else []) + following[used:]
+    parameters = [line for line in parameters if line and "详见技术规范书" not in line]
+    return _clean_table_text("".join(name_parts)), re.sub(r"\s+", " ", " ".join(parameters)).strip()
+
+
+def _descriptive_procurement_rows(
+        pages: list[PageText]) -> tuple[list[dict[str, Any]], set[tuple[str, int]]]:
+    """Parse cross-page tables laid out as 采购内容/技术参数/数量/单位."""
+    rows: list[dict[str, Any]] = []
+    consumed: set[tuple[str, int]] = set()
+    active = False
+    current_file = ""
+    section = "设备部分"
+    expected_row = 1
+    product_units = "台|套|个|块|只|批|系统|项|组|路|点|端|授权|根|副"
+
+    def parse_segment(lines: list[str], page: PageText, row_start: int, group: str) -> int:
+        starts: list[tuple[int, int, str]] = []
+        expected = row_start
+        for index, line in enumerate(lines):
+            match = re.match(r"^(\d{1,3})\s+(.+)$", line)
+            if (match and int(match.group(1)) == expected
+                    and not re.match(rf"^(?:{product_units})(?:\s|$|[（(])", match.group(2))):
+                starts.append((index, expected, match.group(2)))
+                expected += 1
+        for row_index, (start, number, first) in enumerate(starts):
+            end = starts[row_index + 1][0] if row_index + 1 < len(starts) else len(lines)
+            block_lines = [first] + lines[start + 1:end]
+            quantity_matches = list(re.finditer(
+                rf"(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>{product_units})(?=\s|$|[，,；;。])",
+                "\n".join(block_lines),
+            ))
+            if not quantity_matches:
+                continue
+            quantity = quantity_matches[-1]
+            before_quantity = "\n".join(block_lines)[:quantity.start()]
+            body_lines = [re.sub(r"\s+", " ", line).strip()
+                          for line in before_quantity.splitlines() if line.strip()]
+            if not body_lines:
+                continue
+            name, parameters = _descriptive_name_and_parameters(body_lines[0], body_lines[1:])
+            if not name or len(name) > 80:
+                continue
+            rows.append({
+                "row_number": number,
+                "section": group,
+                "name": name,
+                "technical_parameters": parameters,
+                "quantity": float(quantity.group("qty")),
+                "unit": quantity.group("unit"),
+                "file_name": page.file_name,
+                "page": page,
+            })
+        return expected
+
+    for page in pages:
+        if page.file_name != current_file:
+            current_file = page.file_name
+            active = False
+            section = "设备部分"
+            expected_row = 1
+        has_header = bool(DESCRIPTIVE_PROCUREMENT_HEADER_RE.search(page.text))
+        if has_header and "明细报价表" in page.text:
+            active = True
+            section = "设备部分"
+            expected_row = 1
+        if not active:
+            continue
+        consumed.add((page.file_name, page.page))
+        lines = [re.sub(r"\s+", " ", line).strip() for line in page.text.splitlines() if line.strip()]
+        lines = [line for line in lines if not re.search(r"序\s*号.*采购\s*内容.*技术\s*参数.*数\s*量.*单\s*位", line)]
+        equipment_total = next((i for i, line in enumerate(lines) if "设备部分合计" in line), None)
+        service_total = next((i for i, line in enumerate(lines) if "服务部分合计" in line), None)
+        if section == "设备部分":
+            equipment_lines = lines[:equipment_total] if equipment_total is not None else lines
+            expected_row = parse_segment(equipment_lines, page, expected_row, section)
+            if equipment_total is not None:
+                section = "服务部分"
+                expected_row = 1
+                service_lines = lines[equipment_total + 1:service_total]
+                expected_row = parse_segment(service_lines, page, expected_row, section)
+        else:
+            service_lines = lines[:service_total] if service_total is not None else lines
+            expected_row = parse_segment(service_lines, page, expected_row, section)
+        if service_total is not None:
+            active = False
+    return rows, consumed
+
+
+def _price_quote_rows(
+        pages: list[PageText]) -> tuple[dict[str, list[dict[str, str]]], set[tuple[str, int]]]:
+    """Read the separate brand/model/price table that follows a descriptive list."""
+    by_file: dict[str, list[dict[str, str]]] = {}
+    consumed: set[tuple[str, int]] = set()
+    active = False
+    current_file = ""
+    row_re = re.compile(
+        r"(?P<prefix>.*?)\s+(?P<net_unit>\d+(?:\.\d+)?)\s+"
+        r"(?P<tax>\d{1,2}%)\s+(?P<gross_unit>\d+(?:\.\d+)?)\s+"
+        r"(?P<net_total>\d+(?:\.\d+)?)\s+(?P<gross_total>\d+(?:\.\d+)?)(?=\s|$)",
+        re.S,
+    )
+    for page in pages:
+        if page.file_name != current_file:
+            current_file = page.file_name
+            active = False
+        if PRICE_TABLE_HEADER_RE.search(page.text):
+            active = True
+        if not active:
+            continue
+        consumed.add((page.file_name, page.page))
+        text = re.sub(r"南京市（?\d+）?信息化项目明细报价表", " ", page.text)
+        text = re.sub(r"品牌\s*型号\s*不含税单价\s*（元）\s*增值税税\s*率\s*含税单价\s*（元）\s*不含税总价\s*（元）\s*含税总价\s*（元）\s*备注", " ", text)
+        for match in row_re.finditer(text):
+            prefix = re.sub(r"提供安全证\s*书或检测报\s*告", " ", match.group("prefix"))
+            if re.search(r"/\s*/\s*$", prefix):
+                brand, model = "/", "/"
+            elif slash_model := re.search(r"(?:^|\s)/\s+(?P<model>[^/\s].*?)\s*$", prefix, re.S):
+                brand = "/"
+                model = _clean_table_text(slash_model.group("model"))
+            else:
+                prefix = re.sub(r"设备部分合计.*", " ", prefix, flags=re.S)
+                prefix = re.sub(r"\s+", " ", prefix).strip(" /，,；;")
+                brand_model = re.search(r"(?P<brand>[\u4e00-\u9fff]{2,12}|/)\s+(?P<model>.+)$", prefix)
+                if not brand_model:
+                    continue
+                brand = brand_model.group("brand")
+                model = _clean_table_text(brand_model.group("model"))
+                model = re.sub(r"(?<=[A-Za-z])\s+(?=[A-Za-z])", "", model)
+            by_file.setdefault(page.file_name, []).append({
+                "brand": brand,
+                "model": model,
+                "不含税单价": match.group("net_unit"),
+                "增值税税率": match.group("tax"),
+                "含税单价": match.group("gross_unit"),
+                "不含税总价": match.group("net_total"),
+                "含税总价": match.group("gross_total"),
+            })
+        if "总价（含税总限价" in page.text:
+            active = False
+    return by_file, consumed
+
+
+def _quantity_first_procurement_rows(
+        pages: list[PageText]) -> tuple[list[dict[str, Any]], set[tuple[str, int]]]:
+    """Parse tables ordered as 名称/数量/单位/品牌/型号/税率/价格."""
+    rows: list[dict[str, Any]] = []
+    consumed: set[tuple[str, int]] = set()
+    current_file = ""
+    active = False
+    section = "设备部分"
+    expected_row = 1
+    units = "台|套|个|块|只|批|系统|项|组|路|点|端|授权|根|副"
+    row_value_re = re.compile(
+        rf"^(?P<name>.+?)\s+(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>{units})\s+"
+        r"(?P<brand>\S+)\s+(?P<model>.+?)\s+(?P<tax>\d{1,2}%)\s+"
+        r"(?P<gross_unit>\d+(?:\.\d+)?)\s+(?P<gross_total>\d+(?:\.\d+)?)"
+        r"(?:\s+[A-Z]{2,}[A-Z0-9]+)?$",
+        re.S,
+    )
+
+    def parse_segment(lines: list[str], page: PageText, row_start: int, group: str) -> int:
+        starts: list[tuple[int, int, str]] = []
+        expected = row_start
+        for index, line in enumerate(lines):
+            match = re.match(r"^(\d{1,3})\s+(.+)$", line)
+            if (match and int(match.group(1)) == expected
+                    and not re.match(rf"^(?:{units})(?:\s|$|[（(])", match.group(2))):
+                starts.append((index, expected, match.group(2)))
+                expected += 1
+        for row_index, (start, number, first) in enumerate(starts):
+            end = starts[row_index + 1][0] if row_index + 1 < len(starts) else len(lines)
+            block = re.sub(r"\s+", " ", " ".join([first] + lines[start + 1:end])).strip()
+            parsed = row_value_re.match(block)
+            if not parsed:
+                continue
+            name = _clean_table_text(parsed.group("name"))
+            name = re.sub(
+                r"(?<=[A-Za-z0-9.])\s+(?=[\u4e00-\u9fff])|(?<=[\u4e00-\u9fff])\s+(?=[A-Za-z0-9])",
+                "", name,
+            )
+            model = _clean_table_text(parsed.group("model"))
+            if not name or len(name) > 100:
+                continue
+            rows.append({
+                "row_number": number,
+                "section": group,
+                "name": name,
+                "brand": _clean_table_text(parsed.group("brand")),
+                "model": model,
+                "quantity": float(parsed.group("qty")),
+                "unit": parsed.group("unit"),
+                "增值税税率": parsed.group("tax"),
+                "含税单价": parsed.group("gross_unit"),
+                "含税总价": parsed.group("gross_total"),
+                "page": page,
+            })
+        return expected
+
+    for page in pages:
+        if page.file_name != current_file:
+            current_file = page.file_name
+            active = False
+            section = "设备部分"
+            expected_row = 1
+        has_header = bool(QUANTITY_FIRST_TABLE_HEADER_RE.search(page.text))
+        if has_header and not active:
+            active = True
+            section = "设备部分"
+            expected_row = 1
+        if not active:
+            continue
+        consumed.add((page.file_name, page.page))
+        lines = [re.sub(r"\s+", " ", line).strip() for line in page.text.splitlines() if line.strip()]
+        equipment_total = next((i for i, line in enumerate(lines) if "设备部分合计" in line), None)
+        service_total = next((i for i, line in enumerate(lines) if "服务部分合计" in line), None)
+
+        # Some PDF tables split the final character of the previous row across a
+        # page boundary (for example “交换” / next page “机”). Recover that short
+        # suffix before scanning the continuation rows.
+        if rows and section == "设备部分":
+            first_row_at = next((i for i, line in enumerate(lines)
+                                 if re.match(rf"^{expected_row}\s+", line)), None)
+            if first_row_at:
+                suffix = lines[first_row_at - 1].strip()
+                if (1 <= len(suffix) <= 4 and re.search(r"[\u4e00-\u9fffA-Za-z]", suffix)
+                        and not re.search(r"序|号|名称|数量|单位|品牌|型号|税|价|元|率", suffix)):
+                    rows[-1]["name"] = _clean_table_text(rows[-1]["name"] + suffix)
+
+        if section == "设备部分":
+            equipment_lines = lines[:equipment_total] if equipment_total is not None else lines
+            expected_row = parse_segment(equipment_lines, page, expected_row, section)
+            if equipment_total is not None:
+                section = "服务部分"
+                expected_row = 1
+                service_lines = lines[equipment_total + 1:service_total]
+                expected_row = parse_segment(service_lines, page, expected_row, section)
+        else:
+            service_lines = lines[:service_total] if service_total is not None else lines
+            expected_row = parse_segment(service_lines, page, expected_row, section)
+        if service_total is not None or re.search(r"\n\s*总\s*计\b", page.text):
+            active = False
+    return rows, consumed
+
+
 def _extract_equipment(project: str, direction: str, pages: list[PageText], evidence: list[EvidenceRef]) -> list[EquipmentItem]:
     items: list[EquipmentItem] = []
     seen: set[tuple[str, str, float | None]] = set()
+    product_rows, product_pages = _cross_page_product_rows(pages)
+    for row in product_rows:
+        page = row["page"]
+        name = row["name"]
+        qty = row["quantity"]
+        unit = row["unit"]
+        key = (name, row["model"], qty)
+        if key in seen:
+            continue
+        seen.add(key)
+        ev_id = f"EV-{project}-{direction}-ITEM-{len(items)+1:04d}"
+        quote = (f"清单第{row['row_number']}项：{name}，品牌{row['brand'] or '未列明'}，"
+                 f"型号{row['model'] or '未列明'}，数量{qty:g}{unit}")
+        evidence.append(EvidenceRef(ev_id, project, direction, "设备材料清单", name, page.file_name, page.page,
+                                    quote, page.method, page.confidence or "",
+                                    bool(page.confidence and page.confidence < .9)))
+        category = "软件/服务" if re.search(r"软件|平台|模块|授权|服务|实施|集成|运维", name) else "设备"
+        items.append(EquipmentItem(category, name, name, row["brand"], row["model"], unit, qty,
+                                   {}, direction, ev_id, float(page.confidence or .9),
+                                   "采购交付清单"))
+    quantity_first_rows, quantity_first_pages = _quantity_first_procurement_rows(pages)
+    for row in quantity_first_rows:
+        page = row["page"]
+        name = row["name"]
+        qty = row["quantity"]
+        unit = row["unit"]
+        key = (name, row["model"], qty)
+        if key in seen:
+            continue
+        seen.add(key)
+        ev_id = f"EV-{project}-{direction}-ITEM-{len(items)+1:04d}"
+        quote = (f"{row['section']}清单第{row['row_number']}项：{name}，数量{qty:g}{unit}，"
+                 f"品牌{row['brand']}，型号{row['model']}")
+        evidence.append(EvidenceRef(ev_id, project, direction, "设备材料清单", name, page.file_name, page.page,
+                                    quote, page.method, page.confidence or "",
+                                    bool(page.confidence and page.confidence < .9)))
+        parameters = {"清单分组": row["section"], "增值税税率": row["增值税税率"],
+                      "含税单价": row["含税单价"], "含税总价": row["含税总价"]}
+        category = "软件/服务" if row["section"] == "服务部分" or re.search(
+            r"软件|平台|模块|授权|服务|实施|集成|运维", name) else "设备"
+        items.append(EquipmentItem(category, name, name, row["brand"], row["model"], unit, qty,
+                                   parameters, direction, ev_id, float(page.confidence or .9),
+                                   "采购交付清单"))
+    descriptive_rows, descriptive_pages = _descriptive_procurement_rows(pages)
+    price_rows_by_file, price_pages = _price_quote_rows(pages)
+    price_indexes: dict[str, int] = {}
+    for row in descriptive_rows:
+        file_name = row["file_name"]
+        price_index = price_indexes.get(file_name, 0)
+        file_prices = price_rows_by_file.get(file_name, [])
+        price = file_prices[price_index] if price_index < len(file_prices) else {}
+        price_indexes[file_name] = price_index + 1
+        page = row["page"]
+        name = row["name"]
+        qty = row["quantity"]
+        unit = row["unit"]
+        key = (name, price.get("model", ""), qty)
+        if key in seen:
+            continue
+        seen.add(key)
+        ev_id = f"EV-{project}-{direction}-ITEM-{len(items)+1:04d}"
+        quote = (f"{row['section']}清单第{row['row_number']}项：{name}，数量{qty:g}{unit}"
+                 f"，品牌{price.get('brand') or '未列明'}，型号{price.get('model') or '未列明'}")
+        evidence.append(EvidenceRef(ev_id, project, direction, "设备材料清单", name, page.file_name, page.page,
+                                    quote, page.method, page.confidence or "",
+                                    bool(page.confidence and page.confidence < .9)))
+        parameters = {"清单分组": row["section"]}
+        if row["technical_parameters"]:
+            parameters["技术参数"] = row["technical_parameters"]
+        parameters.update({key: value for key, value in price.items() if key not in {"brand", "model"}})
+        category = "软件/服务" if row["section"] == "服务部分" or re.search(
+            r"软件|平台|模块|授权|服务|实施|集成|运维", name) else "设备"
+        items.append(EquipmentItem(category, name, name, price.get("brand", ""), price.get("model", ""),
+                                   unit, qty, parameters, direction, ev_id,
+                                   float(page.confidence or .9), "采购交付清单"))
     spare_page_keys: set[tuple[str, int]] = set()
     spare_scan_active = False
     spare_scan_file = ""
@@ -60,7 +521,30 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
             spare_scan_active = False
     material_table_active = False
     expected_row = 1
+    procurement_section = ""
     for page in pages:
+        if ((page.file_name, page.page) in product_pages
+                or (page.file_name, page.page) in quantity_first_pages
+                or (page.file_name, page.page) in descriptive_pages
+                or (page.file_name, page.page) in price_pages):
+            continue
+        if PROCUREMENT_TABLE_HEADER_RE.search(page.text):
+            rows, procurement_section = _procurement_rows(page.text, procurement_section)
+            for row in rows:
+                ev_id = f"EV-{project}-{direction}-ITEM-{len(items)+1:04d}"
+                name = row["name"]
+                quote = (f"{row['section'] + '，' if row['section'] else ''}清单第{row['row_number']}项：{name}，"
+                         f"品牌{row['brand'] or '未列明'}，型号{row['model'] or '未列明'}，"
+                         f"数量{row['quantity']:g}{row['unit']}")
+                evidence.append(EvidenceRef(ev_id, project, direction, "设备材料清单", name, page.file_name, page.page,
+                                            quote, page.method, page.confidence or "",
+                                            bool(page.confidence and page.confidence < .9)))
+                category = "软件/服务" if re.search(r"软件|平台开发|部署实施|系统集成|授权|费用", name) else "设备"
+                parameters = {"清单分组": row["section"]} if row["section"] else {}
+                items.append(EquipmentItem(category, name, name, row["brand"], row["model"], row["unit"],
+                                           row["quantity"], parameters, direction, ev_id,
+                                           float(page.confidence or .9), "采购交付清单"))
+            continue
         table_start = bool(TABLE_HINT_RE.search(page.text) and re.search(r"单\s*位", page.text)
                            and re.search(r"数\s*量", page.text))
         if table_start:
@@ -275,9 +759,28 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
     return items
 
 
-def _time_sentence(page: PageText, term: str) -> str:
-    pos = page.text.find(term)
-    return _sentence(page.text, pos) if pos >= 0 else ""
+def _milestone_candidate(pages: list[PageText], terms: tuple[str, ...]) -> tuple[PageText, str, re.Match[str] | None] | None:
+    relative_re = re.compile(
+        r"(?:(?:子)?合同(?:签订|签署|生效)|(?:收到|接到).{0,20}?)?(?:后|之日起)\s*"
+        r"([0-9一二两三四五六七八九十]+)\s*(个?工作日|日历日|日历天|天|日|个月|月)(?:内)?"
+    )
+    candidates: list[tuple[int, PageText, str, re.Match[str] | None]] = []
+    for page in pages:
+        normalized = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", page.text)
+        normalized = re.sub(r"[\r\n]+", " ", normalized)
+        for term in terms:
+            for match in re.finditer(re.escape(term), normalized):
+                raw = _sentence(normalized, match.start())
+                relative = relative_re.search(raw)
+                explicit_date = re.search(r"20\d{2}[年./-]\d{1,2}[月./-]\d{1,2}日?", raw)
+                score = (120 if explicit_date else 0) + (100 if relative else 0)
+                score += 20 if re.search(r"完成|应在|应于|不迟于|期限", raw) else 0
+                score += min(len(term), 6)
+                candidates.append((score, page, raw, relative))
+    if not candidates:
+        return None
+    _, page, raw, relative = max(candidates, key=lambda value: value[0])
+    return page, raw, relative
 
 
 def _cn_number(value: str) -> int | None:
@@ -394,26 +897,36 @@ def _extract_time_plan(project: str, direction: str, pages: list[PageText], resu
         calculation_status = "已计算"
 
     details: dict[str, dict[str, Any]] = {}
-    milestone_terms = {"到货": ("设备到货", "到货"), "初验": ("初验", "初步验收"), "终验": ("终验", "最终验收", "竣工验收")}
+    milestone_terms = {
+        "到货": ("设备到货", "硬件供货", "完成供货", "供货", "交货", "到货"),
+        "初验": ("初验", "初步验收", "进场验收"),
+        "终验": ("终验", "最终验收", "竣工验收"),
+    }
     milestones: dict[str, str] = {}
     for name, terms in milestone_terms.items():
-        hit = next(((p, term) for p in pages for term in terms if term in p.text), None)
+        hit = _milestone_candidate(pages, terms)
         if not hit:
             details[name] = {"原文": "", "相对期限": "", "计算日期": "", "计算状态": "合同未约定该节点"}
             continue
-        page, term = hit
-        raw = _time_sentence(page, term)
+        page, raw, relative = hit
         date_match = re.search(r"(20\d{2})[年./-](\d{1,2})[月./-](\d{1,2})日?", raw)
-        relative = re.search(r"(?:后|之日起|收到.{0,15}后)\s*([0-9一二两三四五六七八九十]+)\s*(个?工作日|日历天|天|日|个月|月)", raw)
         calculated = ""
         if date_match:
             calculated = f"{int(date_match.group(1)):04d}-{int(date_match.group(2)):02d}-{int(date_match.group(3)):02d}"
             status = "合同约定了明确日期"
         elif relative:
-            status = "有相对期限，但缺少可确定的基准日期"
+            relative_value = _cn_number(relative.group(1))
+            relative_unit = relative.group(2)
+            contract_date = str(result.get("合同签约日期") or "")
+            if contract_date and relative_value is not None and relative_unit in {"日", "天", "日历日", "日历天"} and "合同" in relative.group(0):
+                calculated = (date.fromisoformat(contract_date) + timedelta(days=relative_value)).isoformat()
+                status = "已按合同签约日期计算"
+            else:
+                status = "有明确相对期限，但缺少可确定的基准日期"
         else:
             status = "合同提及该节点，但未明确时间"
-        details[name] = {"原文": raw, "相对期限": relative.group(0) if relative else "", "计算日期": calculated, "计算状态": status}
+        details[name] = {"原文": raw, "相对期限": relative.group(0) if relative else "", "计算日期": calculated,
+                         "计算状态": status}
         if calculated:
             milestones[name] = calculated
         ev_id = f"EV-{project}-{direction}-TIME-{name}"
@@ -474,7 +987,8 @@ def analysis_to_structured(project: str, direction: str, output: ContractOutput)
         str(result.get("合同签约日期") or "") or None, None, kind, equipment, plan, scopes,
         {"服务内容": str(result.get("服务内容", "")), "乙方义务": str(result.get("乙方义务", "")),
          "关键条款": str(result.get("关键条款", ""))}, evidence,
-        {"file_hash": output.fingerprint, "source_files": output.source_files, "parse_version": "2026.08-v1"},
+        {"file_hash": output.fingerprint, "source_files": output.source_files,
+         "parse_version": "2026.08-v11-procurement-delivery-milestones"},
         [str(result.get("复核原因"))] if result.get("待人工复核") == "是" else [], procurement_involved, procurement_note)
     return contract
 

@@ -11,7 +11,7 @@ from contract_extraction.api import create_app
 from contract_extraction.review_export import _header_cn, export_project_reviews, export_review
 from contract_extraction.project_io import scan_projects
 from contract_extraction.revenue_plan import compare_income_collection_plan, extract_plan_periods
-from contract_extraction.structured import _extract_equipment
+from contract_extraction.structured import _extract_equipment, _extract_time_plan
 from contract_extraction.models import PageText
 from contract_extraction.storage import ReviewStore
 from contract_extraction.system_models import ContractStructured, EquipmentItem, ScopeItem, TimePlan
@@ -44,6 +44,20 @@ class ReviewSystemTests(unittest.TestCase):
             self.assertTrue(any(getattr(route, "path", "") == "/api/tasks" for route in app.routes))
             self.assertTrue(any(getattr(route, "path", "") == "/api/projects/{project_code}" and
                                 "DELETE" in getattr(route, "methods", set()) for route in app.routes))
+
+    def test_home_supports_project_detail_and_section_hash_routes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = create_app(Path(tmp) / "contracts", Path(tmp) / "results")
+            home = next(route.endpoint for route in app.routes if getattr(route, "path", "") == "/")
+            html = home()
+            self.assertIn('id="view-detail"', html)
+            self.assertIn('id="detail-equipment"', html)
+            self.assertIn('id="detailEditPanel"', html)
+            self.assertIn('id="detailEditForm"', html)
+            self.assertIn("function openProject", html)
+            self.assertIn("function openDetailEditor", html)
+            self.assertIn("#project/${code}/equipment", html)
+            self.assertIn("deleteProject(currentProjectCode)", html)
 
     def test_delete_project_removes_files_results_and_database_records(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -149,6 +163,137 @@ class ReviewSystemTests(unittest.TestCase):
         self.assertEqual(spares[0].model, "Xeon Silver 4216@2.1GHz×2")
         self.assertEqual(spares[-1].standard_name, "40G 光模块")
 
+    def test_cross_page_procurement_table_with_quantity_before_unit_is_extracted(self):
+        header = "序号 名称 品牌 型号/软件版本号 数量 含税单价（单位：元） 含税合价（单位：元） 增值税税率"
+        pages = [
+            PageText("前向.pdf", "前向.pdf", 3, "\n".join([
+                "南京卷烟厂", header,
+                "1 监控摄像机 海康威视 DS-2CD264XV3-LD 73 台 525 38325 13%",
+                "2 液位传感器 海康威视 NP-FSC210-4G 1 台 822 822 13%",
+                "3 统一平台开发费用 海康威视 Infovision iWork-Safety 企业安全生产管理平台 1.9.101 1 套 182732 182732 13%",
+            ]), "原生文本层", confidence=1.0),
+            PageText("前向.pdf", "前向.pdf", 4, "\n".join([
+                header,
+                "3 热成像摄像机 海康威视 HM-TD26XS-D 2 台 2467 4934 13%",
+                "淮阴卷烟厂", header,
+                "1 手持巡查终端 康凯思特 conquest-F5 8 台 7081 56648 13%",
+                "2 5G 布控球 海康威视 iDS-MCD432 2 套 23984 47968 13%",
+            ]), "原生文本层", confidence=1.0),
+        ]
+        items = _extract_equipment("P1", "前向", pages, [])
+        self.assertEqual(len(items), 6)
+        self.assertEqual((items[0].standard_name, items[0].brand, items[0].model,
+                          items[0].quantity, items[0].unit),
+                         ("监控摄像机", "海康威视", "DS-2CD264XV3-LD", 73, "台"))
+        self.assertEqual(items[-1].standard_name, "5G 布控球")
+        self.assertEqual(items[-1].technical_parameters["清单分组"], "淮阴卷烟厂")
+        self.assertTrue(all(item.list_type == "采购交付清单" for item in items))
+
+    def test_product_table_continues_on_page_without_repeated_header(self):
+        header = "序号 产品名称 品牌 规格型号 数量 单位 分项单价 分项总价 税率"
+        pages = [
+            PageText("前向.pdf", "前向.pdf", 7, "\n".join([
+                "附件1.清单", header,
+                "1 教学办公区智能管理平台 锐捷 RG-UNC-CS 1 套 338069 338069 13%",
+                "2 教学办公区综合运维平台 锐捷 RG-Enjoy 1 套 500100 500100 13%",
+            ]), "原生文本层", confidence=1.0),
+            PageText("前向.pdf", "前向.pdf", 8, "\n".join([
+                "3 万兆光汇聚交换机 锐捷 RG-S7610-10SFXP2CQ 3 台 212874 638622 13%",
+                "4 集成服务费 中电鸿信 定制 1 项 1200000 1200000 6%",
+                "以上合计（单位：元）7898800.00",
+            ]), "原生文本层", confidence=1.0),
+        ]
+        items = _extract_equipment("P1", "前向", pages, [])
+        self.assertEqual(len(items), 4)
+        self.assertEqual(items[2].standard_name, "万兆光汇聚交换机")
+        self.assertEqual((items[3].standard_name, items[3].category), ("集成服务费", "软件/服务"))
+
+    def test_descriptive_procurement_table_is_joined_with_separate_price_table(self):
+        pages = [
+            PageText("后向.pdf", "后向.pdf", 26, "\n".join([
+                "南京市（202603270017）信息化项目明细报价表",
+                "序号 采购内容 技术参数 数量 单位",
+                "1 监控设备1", "1.设备支持全景摄像头；", "详见技术规范书，", "8 台",
+                "2 智能识别处理", "设备1", "支持危险作业监管、离岗睡岗；", "详见技术规范书，", "4 台",
+            ]), "原生文本层", confidence=1.0),
+            PageText("后向.pdf", "后向.pdf", 27, "\n".join([
+                "3 水流量采集传", "感器（DN40）", "输出信号：4～20mA；", "详见技术规范书，", "2 台",
+            ]), "原生文本层", confidence=1.0),
+            PageText("后向.pdf", "后向.pdf", 30, "\n".join([
+                "4 软件模块", "环境搭建、安装配置和系统联调；", "详见技术规范书，", "5 项",
+                "设备部分合计（含税最高限价4766550元）",
+                "1 需求调研与方", "案规划服务", "需求调研与方案规划，包含：", "1、业务需求梳理", "1 项",
+                "服务部分合计（含税最高限价2100550元）",
+            ]), "原生文本层", confidence=1.0),
+            PageText("后向.pdf", "后向.pdf", 31, "\n".join([
+                "品牌 型号 不含税单价（元） 增值税税率 含税单价（元） 不含税总价（元） 含税总价（元） 备注",
+                "海康威视 iDS-", "MCD432 18580 13% 20995.4 148640 167963.2",
+                "海康威视 iDS-", "96128NX-H16/HWF 44250 13% 50002.5 177000 200010",
+                "海康威视 HM-FE00-F0040 3190 13% 3604.7 6380 7209.4",
+            ]), "原生文本层", confidence=1.0),
+            PageText("后向.pdf", "后向.pdf", 35, "\n".join([
+                "/ 定制 99020 13% 111892.6 495100 559463",
+                "设备部分合计（含税最高限价4766550元） 197170 474270.4 /",
+                "/ / 429200 6% 454952 429200 454952",
+                "服务部分合计（含税最高限价2100550元） 429200 454952 /",
+                "总价（含税总限价6867100元) 6168780 6832702.4",
+            ]), "原生文本层", confidence=1.0),
+        ]
+        evidence = []
+        items = _extract_equipment("P1", "后向", pages, evidence)
+        self.assertEqual(len(items), 5, [(item.standard_name, item.brand, item.model) for item in items])
+        self.assertEqual((items[0].standard_name, items[0].brand, items[0].model,
+                          items[0].quantity, items[0].unit),
+                         ("监控设备1", "海康威视", "iDS-MCD432", 8, "台"))
+        self.assertEqual(items[1].standard_name, "智能识别处理设备1")
+        self.assertIn("危险作业监管", items[1].technical_parameters["技术参数"])
+        self.assertEqual(items[2].standard_name, "水流量采集传感器（DN40）")
+        self.assertEqual((items[3].standard_name, items[3].brand, items[3].model),
+                         ("软件模块", "/", "定制"))
+        self.assertEqual(items[4].standard_name, "需求调研与方案规划服务")
+        self.assertEqual(items[4].category, "软件/服务")
+        self.assertEqual(items[4].technical_parameters["增值税税率"], "6%")
+        self.assertEqual(len(evidence), 5)
+
+    def test_quantity_first_procurement_table_is_extracted_across_pages(self):
+        header = "序号 名称 数量 单位 品牌 型号 增值税税率 含税单价（元） 含税总价（元）"
+        pages = [
+            PageText("后向.pdf", "后向.pdf", 2, "\n".join([
+                "合同清单", header,
+                "1 教学办公区智能管理平台 1 套 锐捷 RG-UNC-CS 13% 324546.24 324546.24",
+                "2 教学办公区综合运维平台 1 套 锐捷 RG-Enjoy 13% 480096.00 480096",
+                "3 万兆光汇聚交换机 3 台 锐捷 RG-S7610-10SFXP2CQ 13% 204359.04 613077.12",
+                "4 2.5G 光汇聚交换 4 台 锐捷 RG-S7610-10SFXP2CQ 13% 192135.36 768541.44",
+            ]), "原生文本层", confidence=1.0),
+            PageText("后向.pdf", "后向.pdf", 3, "\n".join([
+                header, "机",
+                "5 48口万兆光汇聚 2 台 锐捷 RG-S6150-48VS8CQ-X 13% 188812.80 377625.6",
+                "6 24口POE交换机 48 台 锐捷 RG-IF2920-24GT4MS-P 13% 2433.60 116812.8",
+                "设备部分合计 6430848.00",
+                "1 集成服务 1 项 南电 / 6% 1152000.00 1152000.00",
+                "服务部分合计 1152000.00", "总计 7582848.00",
+            ]), "原生文本层", confidence=1.0),
+        ]
+        items = _extract_equipment("P1", "后向", pages, [])
+        self.assertEqual(len(items), 7)
+        self.assertEqual((items[0].standard_name, items[0].brand, items[0].model,
+                          items[0].quantity, items[0].unit),
+                         ("教学办公区智能管理平台", "锐捷", "RG-UNC-CS", 1, "套"))
+        self.assertEqual(items[3].standard_name, "2.5G光汇聚交换机")
+        self.assertEqual(items[5].model, "RG-IF2920-24GT4MS-P")
+        self.assertEqual((items[6].standard_name, items[6].category), ("集成服务", "软件/服务"))
+
+    def test_hardware_supply_clause_is_selected_as_delivery_milestone(self):
+        page = PageText("前向.pdf", "前向.pdf", 25,
+                        "第一次付款：子合同签订后 40 日历日内完成硬\n件供货。"
+                        "卖方应在交付前 7 日历日通知买方做好接收准备，到货经买方验收合格后付款。",
+                        "原生文本层", confidence=1.0)
+        plan = _extract_time_plan("P1", "前向", [page], {}, [])
+        delivery = plan.milestone_details["到货"]
+        self.assertIn("子合同签订后 40 日历日内完成硬件供货", delivery["原文"])
+        self.assertIn("40 日历日内", delivery["相对期限"])
+        self.assertEqual(delivery["计算状态"], "有明确相对期限，但缺少可确定的基准日期")
+
     def test_income_plan_period_comparison(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "计划.xls"
@@ -181,11 +326,17 @@ class ReviewSystemTests(unittest.TestCase):
                 ("P002", {"duration_value": None, "duration_unit": "", "duration_conclusion": "按招标文件及投标文件执行"}),
             ]
             for code, plan in payloads:
+                equipment_differences = ([{
+                    "title": "数据库审计设备", "status": "后向未找到", "risk_level": "高风险",
+                    "description": "后向合同未找到该前向设备",
+                    "forward": {"standard_name": "数据库审计设备", "brand": "示例品牌",
+                                "model": "DBA-1000", "quantity": 2.0, "unit": "台"},
+                }] if code == "P001" else [])
                 payload = {
                     "project_code": code, "status": "已完成", "risk_level": "低风险",
                     "forward": {"direction": "前向", "contract_number": code, "contract_name": f"{code}合同",
                                 "time_plan": plan, "parse_metadata": {}},
-                    "backward_contracts": [], "equipment_differences": [], "schedule_differences": [],
+                    "backward_contracts": [], "equipment_differences": equipment_differences, "schedule_differences": [],
                     "plan_differences": [], "scope_differences": [], "review_issues": [],
                 }
                 store.upsert_project(code, str(root / code), "已完成", "低风险", payload)
@@ -200,6 +351,13 @@ class ReviewSystemTests(unittest.TestCase):
             self.assertNotIn("工期单位", rows[0])
             duration_col = rows[0].index("工期")
             self.assertEqual([row[duration_col] for row in rows[1:]], ["12个月", "按招标文件及投标文件执行"])
+            self.assertIn("设备未覆盖风险", full_wb.sheetnames)
+            equipment_rows = list(full_wb["设备未覆盖风险"].values)
+            self.assertEqual(equipment_rows[0], (
+                "项目编码", "前向设备名称", "前向品牌", "前向型号", "前向数量",
+                "后向查找结果", "风险等级", "风险说明"))
+            self.assertEqual(equipment_rows[1][1:7],
+                             ("数据库审计设备", "示例品牌", "DBA-1000", "2台", "未找到", "高风险"))
             full_wb.close()
             self.assertEqual(len(project_paths), 2)
             for path in project_paths:
@@ -208,13 +366,27 @@ class ReviewSystemTests(unittest.TestCase):
                 self.assertEqual(wb["合同解析结果"].max_row, 2)
                 wb.close()
 
-    def test_equipment_shortage(self):
+    def test_equipment_found_is_not_listed_even_if_quantity_is_lower(self):
         f, b = self.contract("前向"), self.contract("后向")
         f.equipment = [EquipmentItem(standard_name="核心交换机", model="S6730", unit="台", quantity=2, evidence_id="F")]
         b.equipment = [EquipmentItem(standard_name="核心交换机", model="S6730", unit="台", quantity=1, evidence_id="B")]
-        result = compare_equipment(f, b)[0]
-        self.assertEqual(result.status, "数量不足")
-        self.assertEqual(result.risk_level, "中风险")
+        self.assertEqual(compare_equipment(f, b), [])
+
+    def test_only_forward_equipment_not_found_backward_is_listed(self):
+        f, b = self.contract("前向"), self.contract("后向")
+        f.equipment = [
+            EquipmentItem(standard_name="核心交换机", model="S6730", evidence_id="F1"),
+            EquipmentItem(standard_name="数据库审计设备", model="DBA-1000", evidence_id="F2"),
+        ]
+        b.equipment = [
+            EquipmentItem(standard_name="交换机", model="S6730", evidence_id="B1"),
+            EquipmentItem(standard_name="后向新增备件", model="SPARE-1", evidence_id="B2"),
+        ]
+        result = compare_equipment(f, b)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].title, "数据库审计设备")
+        self.assertEqual(result[0].status, "后向未找到")
+        self.assertEqual(result[0].risk_level, "高风险")
 
     def test_schedule_late(self):
         f, b = self.contract("前向"), self.contract("后向")

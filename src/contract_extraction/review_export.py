@@ -70,8 +70,12 @@ def _cell_value(value: Any) -> Any:
                 f"起算日期：{value.get('start_date')}" if value.get("start_date") else "",
                 f"预计完成：{value.get('finish_date')}" if value.get("finish_date") else "") if x)
         if "计算状态" in value:
-            return "；".join(x for x in (str(value.get("计算状态", "")), str(value.get("原文", "")),
-                                          str(value.get("计算日期", ""))) if x)
+            return "；".join(x for x in (
+                str(value.get("计算状态", "")),
+                f"相对期限：{value.get('相对期限')}" if value.get("相对期限") else "",
+                str(value.get("原文", "")),
+                f"计算日期：{value.get('计算日期')}" if value.get("计算日期") else "",
+            ) if x)
         if "scope_item" in value:
             return "；".join(x for x in (str(value.get("scope_item", "")), str(value.get("responsibility", "")),
                                           str(value.get("original_text", ""))) if x)
@@ -130,19 +134,12 @@ def export_review(store: ReviewStore, path: Path, project_codes: set[str] | None
     review_rows: list[dict[str, Any]] = []
     for p in projects:
         equipment_differences = p.get("equipment_differences", [])
-        equipment_risk_count = sum(d.get("risk_level") not in {"", "无风险"} for d in equipment_differences)
         summary.append({"项目编码": p["project_code"], "处理状态": p["status"], "风险等级": p["risk_level"],
-                        "设备风险数": equipment_risk_count,
-                        "前后向完全覆盖项数": sum(d.get("status") == "完全覆盖" for d in equipment_differences),
-                        "后向备件要求项数": sum(d.get("status") == "后向新增备件要求" for d in equipment_differences),
+                        "前向设备未覆盖数": len(equipment_differences),
                         "工期风险数": len(p.get("schedule_differences", [])),
                         "收入收款计划差异数": len(p.get("plan_differences", [])),
                         "实施差异数": len(p.get("scope_differences", [])), "待复核数": len(p.get("review_issues", [])),
                         "处理时间": p.get("processed_at", "")})
-        difference_by_evidence: dict[str, dict[str, Any]] = {}
-        for difference in equipment_differences:
-            for evidence_id in difference.get("evidence_ids", []):
-                difference_by_evidence[evidence_id] = difference
         individual_contracts = ([p["forward"]] if p.get("forward") else []) + p.get("backward_contracts", [])
         for contract in individual_contracts:
             if contract:
@@ -166,27 +163,20 @@ def export_review(store: ReviewStore, path: Path, project_codes: set[str] | None
                     "其他关键条款": contract.get("key_clauses", {}).get("关键条款", ""),
                     "页数": metadata.get("page_count", 0), "OCR错误数": metadata.get("ocr_error_count", 0),
                     "解析状态": metadata.get("parse_status", "未知")})
-                if contract.get("equipment"):
-                    for item in contract["equipment"]:
-                        difference = difference_by_evidence.get(item.get("evidence_id", ""), {})
-                        equipment_rows.append({
-                            "记录类型": "清单项", "项目编码": p["project_code"],
-                            "合同方向": contract.get("direction", ""), "合同名称": contract.get("contract_name", ""),
-                            "清单性质": item.get("list_type", "采购交付清单"), "类别": item.get("category", ""),
-                            "标准名称": item.get("standard_name", ""), "合同原始名称": item.get("original_name", ""),
-                            "品牌": item.get("brand", ""), "型号规格": item.get("model", ""),
-                            "单位": item.get("unit", ""), "数量": item.get("quantity"),
-                            "技术参数": item.get("technical_parameters", {}),
-                            "判断结果": difference.get("status", "待匹配"),
-                            "风险等级": difference.get("risk_level", "待确认"),
-                            "风险说明": difference.get("description", "未形成可靠差异判断"),
-                            "证据编号": item.get("evidence_id", ""), "提取置信度": item.get("confidence"),
-                            "货物采购说明": contract.get("procurement_note", ""),
-                        })
-                else:
-                    equipment_rows.append({"记录类型": "清单提取说明", "项目编码": p["project_code"], "合同方向": contract.get("direction", ""),
-                        "合同名称": contract.get("contract_name", ""), "清单提取结果": "无清单项",
-                        "货物采购说明": contract.get("procurement_note", "")})
+        for difference in equipment_differences:
+            item = difference.get("forward", {})
+            quantity = item.get("quantity")
+            quantity_text = "" if quantity in (None, "") else f"{quantity:g}{item.get('unit', '')}"
+            equipment_rows.append({
+                "项目编码": p["project_code"],
+                "前向设备名称": item.get("standard_name") or difference.get("title", ""),
+                "前向品牌": item.get("brand", ""),
+                "前向型号": item.get("model", ""),
+                "前向数量": quantity_text,
+                "后向查找结果": "未找到",
+                "风险等级": difference.get("risk_level", "高风险"),
+                "风险说明": difference.get("description", "后向合同未找到该前向设备"),
+            })
         time_reviews.extend({"记录类型": "前后向工期/节点", "项目编码": p["project_code"], **d}
                             for d in p.get("schedule_differences", []))
         time_reviews.extend({"记录类型": "收入收款计划复核", "项目编码": p["project_code"], **d}
@@ -198,7 +188,7 @@ def export_review(store: ReviewStore, path: Path, project_codes: set[str] | None
                        if project_codes is None or x.get("project_code") in project_codes)
     wb = Workbook(); wb.remove(wb.active)
     sheet_rows = [("项目审查汇总", summary), ("合同解析结果", contracts),
-                  ("时间及收入计划复核", time_reviews), ("设备清单及差异", equipment_rows)]
+                  ("时间及收入计划复核", time_reviews), ("设备未覆盖风险", equipment_rows)]
     if scopes:
         sheet_rows.append(("实施内容差异", scopes))
     sheet_rows.append(("待复核及人工纠正", review_rows))
