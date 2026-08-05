@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -103,8 +104,24 @@ def _add_sheet(wb: Workbook, title: str, rows: list[dict[str, Any]]) -> None:
         ws.column_dimensions[get_column_letter(i)].width = min(max(12, len(h) * 2), 35)
 
 
-def export_review(store: ReviewStore, path: Path) -> Path:
-    projects = [item["payload"] for item in store.list_projects()]
+def _duration_display(plan: dict[str, Any]) -> str:
+    """Return one business-facing duration value without losing textual clauses."""
+    value = plan.get("duration_value")
+    unit = str(plan.get("duration_unit") or "").strip()
+    if value not in (None, ""):
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        return f"{value}{unit}"
+    return str(plan.get("duration_conclusion") or plan.get("duration_raw") or "").strip()
+
+
+def _safe_filename(value: str) -> str:
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip(" .") or "未命名项目"
+
+
+def export_review(store: ReviewStore, path: Path, project_codes: set[str] | None = None) -> Path:
+    projects = [item["payload"] for item in store.list_projects()
+                if project_codes is None or item["project_code"] in project_codes]
     summary: list[dict[str, Any]] = []
     contracts: list[dict[str, Any]] = []
     time_reviews: list[dict[str, Any]] = []
@@ -138,7 +155,7 @@ def export_review(store: ReviewStore, path: Path) -> Path:
                     "甲方": contract.get("party_a", ""), "乙方": contract.get("party_b", ""),
                     "签订日期": contract.get("sign_date", ""), "生效日期": contract.get("effective_date", ""),
                     "合同性质": contract.get("contract_type", ""), "货物采购说明": contract.get("procurement_note", ""),
-                    "工期数值": plan.get("duration_value"), "工期单位": plan.get("duration_unit", ""),
+                    "工期": _duration_display(plan),
                     "工期提取结论": plan.get("duration_conclusion", ""), "合同履约起始日期": plan.get("start_date", ""),
                     "合同履约截止日期": plan.get("finish_date", ""), "起算条件": plan.get("start_condition_type", ""),
                     "工期约定原文": plan.get("duration_raw", ""), "工期计算状态": plan.get("calculation_status", ""),
@@ -177,7 +194,8 @@ def export_review(store: ReviewStore, path: Path) -> Path:
         scopes.extend({"项目编码": p["project_code"], **d} for d in p.get("scope_differences", []))
         review_rows.extend({"记录类型": "待人工复核", "项目编码": p["project_code"], **x}
                            for x in p.get("review_issues", []))
-    review_rows.extend({"记录类型": "人工纠正", **x} for x in store.list_corrections())
+    review_rows.extend({"记录类型": "人工纠正", **x} for x in store.list_corrections()
+                       if project_codes is None or x.get("project_code") in project_codes)
     wb = Workbook(); wb.remove(wb.active)
     sheet_rows = [("项目审查汇总", summary), ("合同解析结果", contracts),
                   ("时间及收入计划复核", time_reviews), ("设备清单及差异", equipment_rows)]
@@ -188,3 +206,20 @@ def export_review(store: ReviewStore, path: Path) -> Path:
         _add_sheet(wb, title, rows)
     path.parent.mkdir(parents=True, exist_ok=True); wb.save(path)
     return path
+
+
+def export_project_reviews(store: ReviewStore, output_dir: Path, timestamp: str,
+                           project_codes: set[str] | None = None) -> list[Path]:
+    """Create one complete review workbook for every selected project."""
+    paths: list[Path] = []
+    for item in store.list_projects():
+        project_code = item["project_code"]
+        if project_codes is not None and project_code not in project_codes:
+            continue
+        paths.append(export_project_review(store, output_dir, project_code, timestamp))
+    return paths
+
+
+def export_project_review(store: ReviewStore, output_dir: Path, project_code: str, timestamp: str) -> Path:
+    path = output_dir / f"{_safe_filename(project_code)}_前后向合同履约风险审查_{timestamp}.xlsx"
+    return export_review(store, path, {project_code})

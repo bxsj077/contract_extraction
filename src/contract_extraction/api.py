@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
 from .project_io import scan_projects
-from .review_export import export_review
+from .review_export import export_project_review, export_review
 from .review_service import CORRECTABLE_FIELDS, ReviewService
 
 
@@ -346,7 +346,16 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
 
     @app.get("/api/export.xlsx")
     def export():
-        path = export_review(service.store, service.output_root / f"前后向合同履约风险审查_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
+        path = export_review(service.store, service.output_root / f"前后向合同履约风险审查_全量_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
+        return FileResponse(path, filename=path.name)
+
+    @app.get("/api/projects/{project_code}/export.xlsx")
+    def export_project(project_code: str):
+        if service.store.get_project(project_code) is None:
+            raise HTTPException(404, "项目不存在")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = export_project_review(
+            service.store, service.output_root / "分项目审查结果", project_code, timestamp)
         return FileResponse(path, filename=path.name)
 
     return app

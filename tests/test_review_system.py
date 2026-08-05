@@ -4,13 +4,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from openpyxl import load_workbook
+
 from contract_extraction.comparisons import compare_equipment, compare_schedule, compare_scopes
 from contract_extraction.api import create_app
-from contract_extraction.review_export import _header_cn
+from contract_extraction.review_export import _header_cn, export_project_reviews, export_review
 from contract_extraction.project_io import scan_projects
 from contract_extraction.revenue_plan import compare_income_collection_plan, extract_plan_periods
 from contract_extraction.structured import _extract_equipment
 from contract_extraction.models import PageText
+from contract_extraction.storage import ReviewStore
 from contract_extraction.system_models import ContractStructured, EquipmentItem, ScopeItem, TimePlan
 
 
@@ -168,6 +171,42 @@ class ReviewSystemTests(unittest.TestCase):
         self.assertEqual(_header_cn("time_plan.start_date"), "实际起算日期")
         self.assertEqual(_header_cn("time_plan.milestones.终验"), "时间节点-终验")
         self.assertEqual(_header_cn("direction"), "结构化合同方向")
+
+    def test_export_merges_duration_and_creates_one_workbook_per_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ReviewStore(root / "review.db")
+            payloads = [
+                ("P001", {"duration_value": 12, "duration_unit": "个月", "duration_conclusion": "12个月"}),
+                ("P002", {"duration_value": None, "duration_unit": "", "duration_conclusion": "按招标文件及投标文件执行"}),
+            ]
+            for code, plan in payloads:
+                payload = {
+                    "project_code": code, "status": "已完成", "risk_level": "低风险",
+                    "forward": {"direction": "前向", "contract_number": code, "contract_name": f"{code}合同",
+                                "time_plan": plan, "parse_metadata": {}},
+                    "backward_contracts": [], "equipment_differences": [], "schedule_differences": [],
+                    "plan_differences": [], "scope_differences": [], "review_issues": [],
+                }
+                store.upsert_project(code, str(root / code), "已完成", "低风险", payload)
+
+            full_path = export_review(store, root / "全量.xlsx")
+            project_paths = export_project_reviews(store, root / "分项目审查结果", "20260805_120000")
+
+            full_wb = load_workbook(full_path, read_only=True, data_only=True)
+            rows = list(full_wb["合同解析结果"].values)
+            self.assertIn("工期", rows[0])
+            self.assertNotIn("工期数值", rows[0])
+            self.assertNotIn("工期单位", rows[0])
+            duration_col = rows[0].index("工期")
+            self.assertEqual([row[duration_col] for row in rows[1:]], ["12个月", "按招标文件及投标文件执行"])
+            full_wb.close()
+            self.assertEqual(len(project_paths), 2)
+            for path in project_paths:
+                wb = load_workbook(path, read_only=True, data_only=True)
+                self.assertEqual(wb["项目审查汇总"].max_row, 2)
+                self.assertEqual(wb["合同解析结果"].max_row, 2)
+                wb.close()
 
     def test_equipment_shortage(self):
         f, b = self.contract("前向"), self.contract("后向")

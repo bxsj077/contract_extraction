@@ -6,7 +6,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-from .review_export import export_review
+from .review_export import export_project_reviews, export_review
 from .review_service import ReviewService
 
 
@@ -22,8 +22,15 @@ def main() -> int:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     service = ReviewService(args.input, args.output, args.config)
     summary = service.run(set(args.projects or []) or None, args.force)
-    excel = export_review(service.store, args.output / f"前后向合同履约风险审查_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    selected_projects = set(args.projects or []) or None
+    excel = export_review(service.store, args.output / f"前后向合同履约风险审查_全量_{timestamp}.xlsx")
+    project_excels = export_project_reviews(
+        service.store, args.output / "分项目审查结果", timestamp, selected_projects)
     summary["Excel"] = str(excel)
+    summary["全量Excel"] = str(excel)
+    summary["分项目Excel目录"] = str(args.output / "分项目审查结果")
+    summary["分项目Excel"] = [str(path) for path in project_excels]
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 
