@@ -11,7 +11,7 @@ from contract_extraction.api import create_app
 from contract_extraction.review_export import _header_cn, export_project_reviews, export_review
 from contract_extraction.project_io import scan_projects
 from contract_extraction.revenue_plan import compare_income_collection_plan, extract_plan_periods
-from contract_extraction.structured import _extract_equipment
+from contract_extraction.structured import _extract_equipment, _extract_time_plan
 from contract_extraction.models import PageText
 from contract_extraction.storage import ReviewStore
 from contract_extraction.system_models import ContractStructured, EquipmentItem, ScopeItem, TimePlan
@@ -148,6 +148,43 @@ class ReviewSystemTests(unittest.TestCase):
         self.assertEqual(len(spares), 6)
         self.assertEqual(spares[0].model, "Xeon Silver 4216@2.1GHz×2")
         self.assertEqual(spares[-1].standard_name, "40G 光模块")
+
+    def test_cross_page_procurement_table_with_quantity_before_unit_is_extracted(self):
+        header = "序号 名称 品牌 型号/软件版本号 数量 含税单价（单位：元） 含税合价（单位：元） 增值税税率"
+        pages = [
+            PageText("前向.pdf", "前向.pdf", 3, "\n".join([
+                "南京卷烟厂", header,
+                "1 监控摄像机 海康威视 DS-2CD264XV3-LD 73 台 525 38325 13%",
+                "2 液位传感器 海康威视 NP-FSC210-4G 1 台 822 822 13%",
+                "3 统一平台开发费用 海康威视 Infovision iWork-Safety 企业安全生产管理平台 1.9.101 1 套 182732 182732 13%",
+            ]), "原生文本层", confidence=1.0),
+            PageText("前向.pdf", "前向.pdf", 4, "\n".join([
+                header,
+                "3 热成像摄像机 海康威视 HM-TD26XS-D 2 台 2467 4934 13%",
+                "淮阴卷烟厂", header,
+                "1 手持巡查终端 康凯思特 conquest-F5 8 台 7081 56648 13%",
+                "2 5G 布控球 海康威视 iDS-MCD432 2 套 23984 47968 13%",
+            ]), "原生文本层", confidence=1.0),
+        ]
+        items = _extract_equipment("P1", "前向", pages, [])
+        self.assertEqual(len(items), 6)
+        self.assertEqual((items[0].standard_name, items[0].brand, items[0].model,
+                          items[0].quantity, items[0].unit),
+                         ("监控摄像机", "海康威视", "DS-2CD264XV3-LD", 73, "台"))
+        self.assertEqual(items[-1].standard_name, "5G 布控球")
+        self.assertEqual(items[-1].technical_parameters["清单分组"], "淮阴卷烟厂")
+        self.assertTrue(all(item.list_type == "采购交付清单" for item in items))
+
+    def test_hardware_supply_clause_is_selected_as_delivery_milestone(self):
+        page = PageText("前向.pdf", "前向.pdf", 25,
+                        "第一次付款：子合同签订后 40 日历日内完成硬\n件供货。"
+                        "卖方应在交付前 7 日历日通知买方做好接收准备，到货经买方验收合格后付款。",
+                        "原生文本层", confidence=1.0)
+        plan = _extract_time_plan("P1", "前向", [page], {}, [])
+        delivery = plan.milestone_details["到货"]
+        self.assertIn("子合同签订后 40 日历日内完成硬件供货", delivery["原文"])
+        self.assertIn("40 日历日内", delivery["相对期限"])
+        self.assertEqual(delivery["计算状态"], "有明确相对期限，但缺少可确定的基准日期")
 
     def test_income_plan_period_comparison(self):
         with tempfile.TemporaryDirectory() as tmp:

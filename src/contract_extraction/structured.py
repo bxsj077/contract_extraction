@@ -14,6 +14,10 @@ TABLE_UNIT_PATTERN = "|".join(r"\s*".join(re.escape(char) for char in unit) for 
 EQUIPMENT_RE = re.compile(rf"(?P<name>[\u4e00-\u9fffA-Za-z0-9\-（）()/.]{{2,45}}?)\s+(?:(?P<model>[A-Za-z][A-Za-z0-9._/\-]{{2,30}})\s+)?(?P<unit>{UNITS})\s*(?P<qty>\d+(?:\.\d+)?)")
 EQUIPMENT_WORDS = re.compile(r"交换机|服务器|防火墙|路由器|存储|软件|平台|系统|模块|终端|摄像机|授权|数据库|线缆|光纤|机柜|配电|网关|钢筋|电缆托架|积水罐|井盖|机制砖|粗砂|碎石|PVC|水泥|混凝土|管材|材料")
 TABLE_HINT_RE = re.compile(r"报价表|报价清单|设备清单|材料清单|工程量清单")
+PROCUREMENT_TABLE_HEADER_RE = re.compile(
+    r"序\s*号.{0,30}名\s*称.{0,30}品\s*牌.{0,60}(?:型\s*号|软件版本号).{0,60}数\s*量",
+    re.S,
+)
 PROCUREMENT_HINT_RE = re.compile(r"(?:设备|材料|货物).{0,8}采购|采购.{0,8}(?:设备|材料|货物)|设备清单|材料清单|报价清单|明细报价表|主材|辅材|材料由.{0,10}提供")
 SCOPE_TERMS = ["供货", "运输", "卸货", "保管", "上架", "安装", "通电", "设备调试", "系统联调", "旧设备拆除",
                "桥架施工", "管线施工", "线缆敷设", "光纤熔接", "配电施工", "防雷接地", "机房改造", "土建恢复", "标识标签",
@@ -42,6 +46,63 @@ def _page_evidence(pages: list[PageText], needle: str) -> tuple[str, int, str, f
     return "", "", "", 0.0
 
 
+def _clean_table_text(value: str) -> str:
+    value = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", value)
+    value = re.sub(r"\s*([/\-])\s*", r"\1", value)
+    value = re.sub(r"(?<=\d)\s+(?=\d)", "", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _split_procurement_columns(body: str) -> tuple[str, str, str]:
+    tokens = body.split()
+    if len(tokens) >= 3 and tokens[-2:] == ["/", "/"]:
+        return _clean_table_text(" ".join(tokens[:-2])), "/", "/"
+    model_index = next((index for index, token in enumerate(tokens[1:], 1)
+                        if len(token) >= 4 and (re.search(r"[-_/]", token)
+                                                or re.search(r"[A-Za-z]", token) and re.search(r"\d", token)
+                                                or re.fullmatch(r"[A-Za-z]{6,}", token))), None)
+    if model_index is None or model_index < 2:
+        return _clean_table_text(body), "", ""
+    return (_clean_table_text(" ".join(tokens[:model_index - 1])),
+            _clean_table_text(tokens[model_index - 1]),
+            _clean_table_text(" ".join(tokens[model_index:])))
+
+
+def _procurement_rows(text: str, initial_section: str = "") -> tuple[list[dict[str, Any]], str]:
+    """Parse repeated/cross-page product tables whose quantity is written as '73 台'."""
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
+    current_section = initial_section
+    starts: list[tuple[int, int, str, str]] = []
+    product_units = "台|套|个|块|只|批|系统|项|组|路|点|端|授权|根|副"
+    for index, line in enumerate(lines):
+        if re.fullmatch(r".{2,50}(?:卷烟厂|有限责任公司|有限公司)", line):
+            current_section = line
+        match = re.match(r"^(\d{1,3})\s+(.+)$", line)
+        if match and not re.match(rf"^(?:{product_units})(?:\s|$|[（(])", match.group(2)):
+            starts.append((index, int(match.group(1)), match.group(2), current_section))
+        elif (line.isdigit() and index + 1 < len(lines)
+              and re.search(r"[\u4e00-\u9fffA-Za-z]", lines[index + 1])
+              and not re.match(r"序\s*号", lines[index + 1])
+              and not re.fullmatch(r".{2,50}(?:卷烟厂|有限责任公司|有限公司)", lines[index + 1])):
+            starts.append((index, int(line), "", current_section))
+    rows: list[dict[str, Any]] = []
+    for row_index, (start, number, first, section) in enumerate(starts):
+        end = starts[row_index + 1][0] if row_index + 1 < len(starts) else min(len(lines), start + 18)
+        block = re.sub(r"\s+", " ", (first + " " + " ".join(lines[start + 1:end])).strip())
+        quantity = re.search(rf"(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>{product_units})(?:\s*[（(][^）)]{{1,30}}[）)])?", block)
+        if not quantity:
+            continue
+        body = block[:quantity.start()].strip(" ：:，,;；")
+        if not re.search(r"[\u4e00-\u9fffA-Za-z]", body):
+            continue
+        name, brand, model = _split_procurement_columns(body)
+        if not name or len(name) > 100:
+            continue
+        rows.append({"row_number": number, "section": section, "name": name, "brand": brand, "model": model,
+                     "quantity": float(quantity.group("qty")), "unit": quantity.group("unit")})
+    return rows, current_section
+
+
 def _extract_equipment(project: str, direction: str, pages: list[PageText], evidence: list[EvidenceRef]) -> list[EquipmentItem]:
     items: list[EquipmentItem] = []
     seen: set[tuple[str, str, float | None]] = set()
@@ -60,7 +121,25 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
             spare_scan_active = False
     material_table_active = False
     expected_row = 1
+    procurement_section = ""
     for page in pages:
+        if PROCUREMENT_TABLE_HEADER_RE.search(page.text):
+            rows, procurement_section = _procurement_rows(page.text, procurement_section)
+            for row in rows:
+                ev_id = f"EV-{project}-{direction}-ITEM-{len(items)+1:04d}"
+                name = row["name"]
+                quote = (f"{row['section'] + '，' if row['section'] else ''}清单第{row['row_number']}项：{name}，"
+                         f"品牌{row['brand'] or '未列明'}，型号{row['model'] or '未列明'}，"
+                         f"数量{row['quantity']:g}{row['unit']}")
+                evidence.append(EvidenceRef(ev_id, project, direction, "设备材料清单", name, page.file_name, page.page,
+                                            quote, page.method, page.confidence or "",
+                                            bool(page.confidence and page.confidence < .9)))
+                category = "软件/服务" if re.search(r"软件|平台开发|部署实施|系统集成|授权|费用", name) else "设备"
+                parameters = {"清单分组": row["section"]} if row["section"] else {}
+                items.append(EquipmentItem(category, name, name, row["brand"], row["model"], row["unit"],
+                                           row["quantity"], parameters, direction, ev_id,
+                                           float(page.confidence or .9), "采购交付清单"))
+            continue
         table_start = bool(TABLE_HINT_RE.search(page.text) and re.search(r"单\s*位", page.text)
                            and re.search(r"数\s*量", page.text))
         if table_start:
@@ -275,9 +354,28 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
     return items
 
 
-def _time_sentence(page: PageText, term: str) -> str:
-    pos = page.text.find(term)
-    return _sentence(page.text, pos) if pos >= 0 else ""
+def _milestone_candidate(pages: list[PageText], terms: tuple[str, ...]) -> tuple[PageText, str, re.Match[str] | None] | None:
+    relative_re = re.compile(
+        r"(?:(?:子)?合同(?:签订|签署|生效)|(?:收到|接到).{0,20}?)?(?:后|之日起)\s*"
+        r"([0-9一二两三四五六七八九十]+)\s*(个?工作日|日历日|日历天|天|日|个月|月)(?:内)?"
+    )
+    candidates: list[tuple[int, PageText, str, re.Match[str] | None]] = []
+    for page in pages:
+        normalized = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", page.text)
+        normalized = re.sub(r"[\r\n]+", " ", normalized)
+        for term in terms:
+            for match in re.finditer(re.escape(term), normalized):
+                raw = _sentence(normalized, match.start())
+                relative = relative_re.search(raw)
+                explicit_date = re.search(r"20\d{2}[年./-]\d{1,2}[月./-]\d{1,2}日?", raw)
+                score = (120 if explicit_date else 0) + (100 if relative else 0)
+                score += 20 if re.search(r"完成|应在|应于|不迟于|期限", raw) else 0
+                score += min(len(term), 6)
+                candidates.append((score, page, raw, relative))
+    if not candidates:
+        return None
+    _, page, raw, relative = max(candidates, key=lambda value: value[0])
+    return page, raw, relative
 
 
 def _cn_number(value: str) -> int | None:
@@ -394,26 +492,36 @@ def _extract_time_plan(project: str, direction: str, pages: list[PageText], resu
         calculation_status = "已计算"
 
     details: dict[str, dict[str, Any]] = {}
-    milestone_terms = {"到货": ("设备到货", "到货"), "初验": ("初验", "初步验收"), "终验": ("终验", "最终验收", "竣工验收")}
+    milestone_terms = {
+        "到货": ("设备到货", "硬件供货", "完成供货", "供货", "交货", "到货"),
+        "初验": ("初验", "初步验收", "进场验收"),
+        "终验": ("终验", "最终验收", "竣工验收"),
+    }
     milestones: dict[str, str] = {}
     for name, terms in milestone_terms.items():
-        hit = next(((p, term) for p in pages for term in terms if term in p.text), None)
+        hit = _milestone_candidate(pages, terms)
         if not hit:
             details[name] = {"原文": "", "相对期限": "", "计算日期": "", "计算状态": "合同未约定该节点"}
             continue
-        page, term = hit
-        raw = _time_sentence(page, term)
+        page, raw, relative = hit
         date_match = re.search(r"(20\d{2})[年./-](\d{1,2})[月./-](\d{1,2})日?", raw)
-        relative = re.search(r"(?:后|之日起|收到.{0,15}后)\s*([0-9一二两三四五六七八九十]+)\s*(个?工作日|日历天|天|日|个月|月)", raw)
         calculated = ""
         if date_match:
             calculated = f"{int(date_match.group(1)):04d}-{int(date_match.group(2)):02d}-{int(date_match.group(3)):02d}"
             status = "合同约定了明确日期"
         elif relative:
-            status = "有相对期限，但缺少可确定的基准日期"
+            relative_value = _cn_number(relative.group(1))
+            relative_unit = relative.group(2)
+            contract_date = str(result.get("合同签约日期") or "")
+            if contract_date and relative_value is not None and relative_unit in {"日", "天", "日历日", "日历天"} and "合同" in relative.group(0):
+                calculated = (date.fromisoformat(contract_date) + timedelta(days=relative_value)).isoformat()
+                status = "已按合同签约日期计算"
+            else:
+                status = "有明确相对期限，但缺少可确定的基准日期"
         else:
             status = "合同提及该节点，但未明确时间"
-        details[name] = {"原文": raw, "相对期限": relative.group(0) if relative else "", "计算日期": calculated, "计算状态": status}
+        details[name] = {"原文": raw, "相对期限": relative.group(0) if relative else "", "计算日期": calculated,
+                         "计算状态": status}
         if calculated:
             milestones[name] = calculated
         ev_id = f"EV-{project}-{direction}-TIME-{name}"
@@ -474,7 +582,8 @@ def analysis_to_structured(project: str, direction: str, output: ContractOutput)
         str(result.get("合同签约日期") or "") or None, None, kind, equipment, plan, scopes,
         {"服务内容": str(result.get("服务内容", "")), "乙方义务": str(result.get("乙方义务", "")),
          "关键条款": str(result.get("关键条款", ""))}, evidence,
-        {"file_hash": output.fingerprint, "source_files": output.source_files, "parse_version": "2026.08-v1"},
+        {"file_hash": output.fingerprint, "source_files": output.source_files,
+         "parse_version": "2026.08-v11-procurement-delivery-milestones"},
         [str(result.get("复核原因"))] if result.get("待人工复核") == "是" else [], procurement_involved, procurement_note)
     return contract
 

@@ -70,8 +70,12 @@ def _cell_value(value: Any) -> Any:
                 f"起算日期：{value.get('start_date')}" if value.get("start_date") else "",
                 f"预计完成：{value.get('finish_date')}" if value.get("finish_date") else "") if x)
         if "计算状态" in value:
-            return "；".join(x for x in (str(value.get("计算状态", "")), str(value.get("原文", "")),
-                                          str(value.get("计算日期", ""))) if x)
+            return "；".join(x for x in (
+                str(value.get("计算状态", "")),
+                f"相对期限：{value.get('相对期限')}" if value.get("相对期限") else "",
+                str(value.get("原文", "")),
+                f"计算日期：{value.get('计算日期')}" if value.get("计算日期") else "",
+            ) if x)
         if "scope_item" in value:
             return "；".join(x for x in (str(value.get("scope_item", "")), str(value.get("responsibility", "")),
                                           str(value.get("original_text", ""))) if x)
