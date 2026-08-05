@@ -8,6 +8,9 @@ from contract_extraction.comparisons import compare_equipment, compare_schedule,
 from contract_extraction.api import create_app
 from contract_extraction.review_export import _header_cn
 from contract_extraction.project_io import scan_projects
+from contract_extraction.revenue_plan import compare_income_collection_plan, extract_plan_periods
+from contract_extraction.structured import _extract_equipment
+from contract_extraction.models import PageText
 from contract_extraction.system_models import ContractStructured, EquipmentItem, ScopeItem, TimePlan
 
 
@@ -84,6 +87,81 @@ class ReviewSystemTests(unittest.TestCase):
             self.assertEqual(len(found.forward_pdfs), 2)
             self.assertEqual(len(found.backward_pdfs), 2)
             self.assertEqual(found.status, "可对比")
+
+    def test_project_scan_detects_income_collection_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "P100"
+            (project / "前向").mkdir(parents=True)
+            (project / "后向").mkdir()
+            (project / "收入收款计划").mkdir()
+            (project / "前向" / "前向.pdf").touch()
+            (project / "后向" / "后向.pdf").touch()
+            (project / "收入收款计划" / "计划.xls").touch()
+            found = scan_projects(project)[0]
+            self.assertEqual(len(found.revenue_plan_files), 1)
+
+    def test_service_resource_table_is_extracted_as_service_objects(self):
+        text = "\n".join(["资源内容", "资源类型", "数量", "含税单价", "高性能型-1", "40", "11,154.15",
+                           "高性能型-2", "服务器资源", "425", "15,913.74",
+                           "生产汇聚交换机资", "44", "34,419.10"])
+        page = PageText("合同.pdf", "合同.pdf", 1, text, "OCR 300DPI", confidence=.95)
+        evidence = []
+        items = _extract_equipment("P1", "前向", [page], evidence)
+        self.assertEqual([(x.standard_name, x.quantity) for x in items],
+                         [("服务器资源服务-高性能型-1", 40), ("服务器资源服务-高性能型-2", 425),
+                          ("生产汇聚交换机资源", 44)])
+        self.assertTrue(all(x.list_type == "维保/服务对象清单" for x in items))
+
+    def test_maintenance_resource_and_multi_page_spare_list_are_extracted(self):
+        page1 = PageText("后向合同.pdf", "后向合同.pdf", 8, "\n".join([
+            "高性能型-1（Redis）", "CPU：2*16核", "服务器", "维护1年", "40",
+            "高性能型-2（应用虚拟化）", "服务器", "维护1年", "425",
+            "高性能型-3（中间件服务器）", "服务器", "维护1年", "245",
+            "高性能型-4（Mysql服务器）", "服务器", "维护1年", "35",
+            "大二层控制器资源", "设备", "维护1年", "1", "原厂质保", "4",
+            "生产汇聚交换机资源", "设备", "维护1年", "44",
+            "管理网/备份网汇聚交换机资源", "设备", "维护1年", "29",
+            "管理网/备份网接入交换机资源", "设备", "维护1年", "13", "合计", "91",
+        ]), "原生文本", confidence=1.0)
+        page2 = PageText("后向合同.pdf", "后向合同.pdf", 9, "\n".join([
+            "六、现场备件库清单", "备件类型", "备件参数", "数量", "单位",
+            "CPU", "Xeon Silver 4216@2.1GHz×2", "3", "块",
+            "内存", "MEMORY H HMA84GR7DJR4N-WM", "12", "块",
+        ]), "原生文本", confidence=1.0)
+        page3 = PageText("后向合同.pdf", "后向合同.pdf", 10, "\n".join([
+            "网卡", "10GB Ethernet converged network adapter", "1", "块",
+            "硬盘", "SSD PM1643a/45a", "6", "块",
+        ]), "原生文本", confidence=1.0)
+        page4 = PageText("后向合同.pdf", "后向合同.pdf", 11, "\n".join([
+            "生产汇聚交换机整机", "生产汇聚交换机整机", "1", "台",
+            "40G 光模块", "40G 光模块", "5", "块",
+            "乙方需建立起不少于上述清单描述的应急备件库",
+        ]), "原生文本", confidence=1.0)
+        items = _extract_equipment("P1", "后向", [page1, page2, page3, page4], [])
+        resources = [item for item in items if item.list_type == "维保/服务对象清单"]
+        spares = [item for item in items if item.list_type == "现场备件库清单"]
+        self.assertEqual(len(resources), 8)
+        self.assertEqual(next(item.quantity for item in resources if item.standard_name == "大二层控制器资源"), 5)
+        self.assertEqual(len(spares), 6)
+        self.assertEqual(spares[0].model, "Xeon Silver 4216@2.1GHz×2")
+        self.assertEqual(spares[-1].standard_name, "40G 光模块")
+
+    def test_income_plan_period_comparison(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "计划.xls"
+            path.write_text('''<?xml version="1.0"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
+<Worksheet ss:Name="收入计划"><Table>
+<Row><Cell><Data ss:Type="String">起始日期</Data></Cell><Cell><Data ss:Type="String">终止日期</Data></Cell></Row>
+<Row><Cell><Data ss:Type="String">2026-04-01</Data></Cell><Cell><Data ss:Type="String">2027-03-31</Data></Cell></Row>
+</Table></Worksheet></Workbook>''', encoding="utf-8")
+            periods = extract_plan_periods(path)
+            self.assertEqual(periods[0]["start_date"], "2026-04-01")
+            contract = self.contract("前向")
+            contract.time_plan = TimePlan(12, "个月", "固定日期区间", start_date="2026-04-16", finish_date="2027-04-15")
+            result = compare_income_collection_plan(contract, [str(path)])[0]
+            self.assertEqual(result.status, "基本一致，需复核偏差")
+            self.assertIn("-15天", result.description)
 
     def test_export_headers_are_chinese(self):
         self.assertEqual(_header_cn("risk_level"), "风险等级")

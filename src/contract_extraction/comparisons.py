@@ -32,10 +32,14 @@ def compare_equipment(forward: ContractStructured, backward: ContractStructured)
             f"前向：{forward.procurement_note}；后向：{backward.procurement_note}", needs_review=True)]
     matched: set[int] = set()
     for f in forward.equipment:
+        service_object = f.list_type == "维保/服务对象清单"
         choices = sorted(((i, _item_score(f, b)) for i, b in enumerate(backward.equipment)), key=lambda x: x[1], reverse=True)
         if not choices or choices[0][1] < .62:
-            results.append(Difference("设备", "后向未采购", "高风险", "EQ-001", f.standard_name,
-                "前向交付项在后向采购清单中未找到可靠匹配。", asdict(f), {}, [f.evidence_id]))
+            status = "后向未覆盖" if service_object else "后向未采购"
+            description = ("前向维保/服务对象在后向合同清单中未找到可靠覆盖。" if service_object
+                           else "前向交付项在后向采购清单中未找到可靠匹配。")
+            results.append(Difference("设备", status, "高风险", "EQ-001", f.standard_name,
+                                      description, asdict(f), {}, [f.evidence_id]))
             continue
         index, score = choices[0]
         b = backward.equipment[index]
@@ -52,8 +56,15 @@ def compare_equipment(forward: ContractStructured, backward: ContractStructured)
                                   [f.evidence_id, b.evidence_id], review))
     for i, item in enumerate(backward.equipment):
         if i not in matched:
-            results.append(Difference("设备", "后向新增", "无风险", "EQ-003", item.standard_name,
-                                      "后向存在前向未列出的新增采购项。", {}, asdict(item), [item.evidence_id]))
+            service_object = item.list_type == "维保/服务对象清单"
+            spare_item = item.list_type == "现场备件库清单"
+            status = "后向新增服务对象" if service_object else ("后向新增备件要求" if spare_item else "后向新增")
+            description = ("后向存在前向未列出的新增服务对象。" if service_object else
+                           ("后向约定了前向未单列的现场应急备件要求。" if spare_item else
+                            "后向存在前向未列出的新增采购项。"))
+            results.append(Difference("设备", status, "无风险", "EQ-003", item.standard_name,
+                                      description,
+                                      {}, asdict(item), [item.evidence_id]))
     return results
 
 

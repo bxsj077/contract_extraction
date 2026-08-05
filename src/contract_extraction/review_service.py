@@ -12,6 +12,7 @@ from .comparisons import RESPONSIBILITY_SCORE, compare_equipment, compare_schedu
 from .pdf_io import LocalOcr, extract_pdf_pages, sha256_file
 from .pipeline import load_config
 from .project_io import scan_projects
+from .revenue_plan import compare_income_collection_plan
 from .rules import analyze_contract
 from .storage import ReviewStore
 from .structured import analysis_to_structured, structured_from_dict, structured_to_dict
@@ -19,7 +20,7 @@ from .system_models import ContractStructured, ProjectFiles, ProjectReviewResult
 
 
 LOGGER = logging.getLogger("contract_review")
-PARSE_VERSION = "2026.08-v8-textual-duration-references"
+PARSE_VERSION = "2026.08-v10-plan-resource-spare-tables"
 CORRECTABLE_FIELDS = {
     "contract_number", "contract_name", "party_a", "party_b", "sign_date", "effective_date", "contract_type",
     "procurement_involved", "procurement_note", "time_plan.duration_value", "time_plan.duration_unit",
@@ -245,18 +246,20 @@ class ReviewService:
                     backward_contracts.append(parsed)
             backward = self._aggregate_backward(project.project_code, backward_contracts)
             equipment = []; schedule = []; scopes = []
+            plan_differences = compare_income_collection_plan(
+                forward, project.revenue_plan_files, int(self.config.get("plan_date_tolerance_days", 31)))
             if forward and backward:
+                equipment = compare_equipment(forward, backward)
                 if "运维类" not in {forward.contract_type, backward.contract_type}:
-                    equipment = compare_equipment(forward, backward)
                     schedule = compare_schedule(forward, backward, int(self.config.get("safety_buffer_days", 15)))
                     scopes = compare_scopes(forward, backward)
                 else:
-                    project.issues.append("存在运维类合同，暂不执行设备、工期和实施内容三项核心对比")
+                    project.issues.append("存在运维类合同，仅执行设备/服务对象清单覆盖和收入收款计划复核，不执行建设工期及实施责任对比")
                 parsed_contracts = ([forward] if forward else []) + backward_contracts
                 status = "部分完成" if any(c.parse_metadata.get("parse_status") != "完整" for c in parsed_contracts) else "已完成"
             else:
                 status = "仅完成单向解析" if forward or backward else "处理失败"
-            all_diffs = equipment + schedule + scopes
+            all_diffs = equipment + schedule + scopes + plan_differences
             risk = overall_risk(all_diffs)
             review_issues = [{"category": "项目完整性", "description": issue} for issue in project.issues]
             for contract in ([forward] if forward else []) + backward_contracts:
@@ -272,7 +275,8 @@ class ReviewService:
                     "设备材料清单项数": len(contract.equipment), "采购备注": contract.procurement_note})
             result = ProjectReviewResult(project.project_code, status, risk, forward, backward, equipment, schedule, scopes,
                                          self._timeline(forward, backward), review_issues, processed_at=now,
-                                         backward_contracts=backward_contracts, contract_parse_statuses=parse_statuses)
+                                         backward_contracts=backward_contracts, contract_parse_statuses=parse_statuses,
+                                         plan_differences=plan_differences)
         except Exception as exc:
             LOGGER.exception("项目%s处理失败", project.project_code)
             result = ProjectReviewResult(project.project_code, "处理失败", "待确认", None, None,

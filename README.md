@@ -12,15 +12,17 @@
 │  ├─ 前向/
 │  │  ├─ 前向主合同.pdf
 │  │  └─ 技术附件.pdf
-│  └─ 后向/
+│  ├─ 后向/
 │     ├─ 后向合同A.pdf
 │     └─ 后向合同B.pdf
+│  └─ 收入收款计划/
+│     └─ 收入收款计划.xls
 └─ JSNJA2600045CGN00/
    ├─ 前向/
    └─ 后向/
 ```
 
-批量处理并导出七张工作表：
+批量处理并导出精简审查工作簿。固定保留项目汇总、合同解析、时间及收入计划复核、设备清单及差异、待复核及人工纠正；仅在存在实施内容差异时增加对应工作表：
 
 ```powershell
 cd C:\Users\keyan\Documents\contract_extraction
@@ -43,6 +45,7 @@ python scripts\run_server.py
 ```text
 C:\Users\keyan\Documents\contract_extraction\data\contracts\<前向合同编号>\前向\*.pdf
 C:\Users\keyan\Documents\contract_extraction\data\contracts\<前向合同编号>\后向\*.pdf
+C:\Users\keyan\Documents\contract_extraction\data\contracts\<前向合同编号>\收入收款计划\*.xls[x]
 C:\Users\keyan\Documents\contract_extraction\data\review_output\contract_review.db
 C:\Users\keyan\Documents\contract_extraction\data\review_output\项目明细\<项目编码>\
 ```
@@ -53,7 +56,7 @@ C:\Users\keyan\Documents\contract_extraction\data\review_output\项目明细\<�
 
 人工纠正“工期数值”时既可输入纯数字，也可直接输入“供货要求等合同文件另有约定”等文字。纯数字写入工期数值；文字会自动将工期数值置空，并同步写入“工期提取结论”，避免把引用其他合同文件的约定误当成数值工期。
 
-系统包括：项目完整性扫描、前后向分别解析和缓存、SQLite 状态库、设备/数量/单位比较、实际时间区间及安全缓冲比较、实施范围和责任强度比较、风险分级、时间轴、人工复核接口、JSON/Excel 导出及 Web 看板。最终风险仅由版本化程序规则生成。
+系统包括：项目完整性扫描、前后向分别解析和缓存、SQLite 状态库、维保资源/采购设备/现场备件清单分类、设备数量和单位比较、合同履约期与收入收款计划复核、实际时间区间及安全缓冲比较、实施范围和责任强度比较、风险分级、人工复核接口、JSON/Excel 导出及 Web 看板。最终风险仅由版本化程序规则生成。
 
 ## 第一层兼容入口
 
@@ -63,7 +66,9 @@ C:\Users\keyan\Documents\contract_extraction\data\review_output\项目明细\<�
 
 - 原生文本层质量检查；质量不足时整页 300DPI 本地 OCR。
 - 签章尾页自动执行 600DPI 局部增强思路：利用红色通道削弱红章，提高被印章遮挡日期的识别率。
-- 合同性质仅输出 `运维类`、`集成实施类` 或空值；运维类停止工期和条款深度抽取。
+- 合同性质仅输出 `运维类`、`集成实施类` 或空值；运维类仍提取明确的服务期、维保对象及现场备件要求，但不执行建设工期和实施责任差异规则。
+- 可读取 Excel 2003 SpreadsheetML（扩展名 `.xls`）及 `.xlsx` 收入/收款计划，并复核计划起止日期与前向合同履约期的偏差。
+- 区分采购交付清单、维保/服务对象清单和现场备件库清单；前后向差异直接回填到每条清单行，避免重复导出一套差异明细。
 - 集成实施类抽取工期、工期起算方式、具体日期、预计结束日期、到货/安装/部署/调试/上线/试运行/验收/交付/质保节点、服务内容、乙方义务和关键条款。
 - 甲方、乙方、其他方签约日期分别留列，并给出合同签约日期。
 - 三方合同只有部分签约日期时，可按配置用已识别日期参与“签约起算”推算，但在说明和证据中明确其不代表全部盖章生效日。

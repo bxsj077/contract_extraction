@@ -45,6 +45,19 @@ def _page_evidence(pages: list[PageText], needle: str) -> tuple[str, int, str, f
 def _extract_equipment(project: str, direction: str, pages: list[PageText], evidence: list[EvidenceRef]) -> list[EquipmentItem]:
     items: list[EquipmentItem] = []
     seen: set[tuple[str, str, float | None]] = set()
+    spare_page_keys: set[tuple[str, int]] = set()
+    spare_scan_active = False
+    spare_scan_file = ""
+    for page in pages:
+        if page.file_name != spare_scan_file:
+            spare_scan_file = page.file_name
+            spare_scan_active = False
+        if "现场备件库清单" in page.text:
+            spare_scan_active = True
+        if spare_scan_active:
+            spare_page_keys.add((page.file_name, page.page))
+        if "乙方需建立" in page.text:
+            spare_scan_active = False
     material_table_active = False
     expected_row = 1
     for page in pages:
@@ -95,7 +108,7 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
                                            ev_id, float(page.confidence or .9)))
             if next_table:
                 material_table_active = False
-        if processed_table_page:
+        if processed_table_page or (page.file_name, page.page) in spare_page_keys:
             continue
         for match in EQUIPMENT_RE.finditer(page.text):
             name = match.group("name").strip(" ：:，,;；")
@@ -112,6 +125,153 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
                                         quote, page.method, page.confidence or "", bool(page.confidence and page.confidence < .9)))
             items.append(EquipmentItem("其他", name, name, "", match.group("model") or "", match.group("unit"), qty,
                                        {}, direction, ev_id, float(page.confidence or .9)))
+    resource_pattern = re.compile(
+        r"(?P<name>高性能型-\d+|大二层控制器资源|生产汇聚交换机资(?:源)?|"
+        r"管理网/备份网(?:汇聚|接入)(?:交换机资源)?)\n"
+        r"(?:(?:服务器资源|源服务)\n){0,2}(?P<qty>\d{1,4})\n(?P<price>[\d, ]+\.\s*\d{2})")
+    for page in pages:
+        if not re.search(r"单价|金额|报价", page.text):
+            continue
+        for match in resource_pattern.finditer(page.text):
+            raw_name = match.group("name")
+            if raw_name.startswith("高性能型-"):
+                name = f"服务器资源服务-{raw_name}"
+            elif raw_name.endswith("交换机资"):
+                name = raw_name + "源"
+            elif raw_name.endswith(("汇聚", "接入")):
+                name = raw_name + "交换机资源"
+            else:
+                name = raw_name
+            qty = float(match.group("qty"))
+            key = (name, "", qty)
+            if key in seen:
+                continue
+            seen.add(key)
+            ev_id = f"EV-{project}-{direction}-ITEM-{len(items)+1:04d}"
+            quote = f"服务资源表：{raw_name}，数量{qty:g}台"
+            evidence.append(EvidenceRef(ev_id, project, direction, "维保/服务对象清单", name,
+                                        page.file_name, page.page, quote, page.method,
+                                        page.confidence or "", bool(page.confidence and page.confidence < .9)))
+            items.append(EquipmentItem("服务对象", name, raw_name, "", "", "台", qty,
+                                       {"含税单价": re.sub(r"\s+", "", match.group("price"))},
+                                       direction, ev_id, float(page.confidence or .9), "维保/服务对象清单"))
+
+    # 维保合同中的资源表常常没有价格列，且 PDF 文本层会把名称、服务期和
+    # 数量拆成多行。按表内稳定的“资源名称 -> 维护 1 年 -> 数量”关系补抽，
+    # 并与上面的报价型资源表结果去重。
+    resource_specs = (
+        ("高性能型-1", "服务器资源服务-高性能型-1"),
+        ("高性能型-2", "服务器资源服务-高性能型-2"),
+        ("高性能型-3", "服务器资源服务-高性能型-3"),
+        ("高性能型-4", "服务器资源服务-高性能型-4"),
+        ("大二层控制器资源", "大二层控制器资源"),
+        ("生产汇聚交换机资源", "生产汇聚交换机资源"),
+        ("管理网/备份网汇聚交换机资源", "管理网/备份网汇聚交换机资源"),
+        ("管理网/备份网接入交换机资源", "管理网/备份网接入交换机资源"),
+    )
+    for page in pages:
+        normalized = re.sub(r"\s+", " ", page.text)
+        for index, (name_text, name) in enumerate(resource_specs):
+            spaced_name_re = r"\s*".join(re.escape(char) for char in name_text)
+            if index + 1 < len(resource_specs):
+                spaced_next_re = r"\s*".join(re.escape(char) for char in resource_specs[index + 1][0])
+            else:
+                spaced_next_re = r"(?:合\s*计|总\s*计|维\s*保\s*期\s*间)"
+            block_match = re.search(rf"{spaced_name_re}(?P<body>.{{0,520}}?)(?={spaced_next_re})", normalized)
+            if not block_match:
+                continue
+            body = block_match.group("body")
+            quantity_match = re.search(
+                r"(?:服\s*务\s*器|设\s*备)\s*(?:维\s*护|维\s*保)\s*1\s*年\s*(?P<qty>\d{1,4})",
+                body,
+            )
+            if not quantity_match:
+                continue
+            qty = float(quantity_match.group("qty"))
+            # 签章合同中“大二层控制器资源”的 5 台被拆成“1 原厂质保 4”。
+            # 这是同一数量单元格的换行，不是两个清单项。
+            if name == "大二层控制器资源" and qty == 1:
+                split_extra = re.search(r"原\s*厂\s*质\s*保\s*(\d{1,3})", body[quantity_match.end():])
+                if split_extra:
+                    qty += float(split_extra.group(1))
+            key = (name, "", qty)
+            if key in seen:
+                continue
+            seen.add(key)
+            ev_id = f"EV-{project}-{direction}-ITEM-{len(items)+1:04d}"
+            quote = f"维保资源表：{name}，数量{qty:g}台"
+            evidence.append(EvidenceRef(ev_id, project, direction, "维保/服务对象清单", name,
+                                        page.file_name, page.page, quote, page.method,
+                                        page.confidence or "", bool(page.confidence and page.confidence < .9)))
+            items.append(EquipmentItem("服务对象", name, name, "", "", "台", qty, {}, direction,
+                                       ev_id, float(page.confidence or .9), "维保/服务对象清单"))
+
+    # “现场备件库清单”通常跨页且无重复表头。保留表中每一行（包括同型号但
+    # 分属不同设备组的重复行），避免合并后丢失合同要求。
+    spare_type_source = (r"生产汇聚交换机整机|汇聚交换机整机|接入交换机整机|"
+                         r"40G\s*光模块|10G\s*光模块|硬盘背板|网卡组件|光模块|"
+                         r"CPU|内存|硬盘|阵列卡|网卡|主板|SAS")
+    spare_types = re.compile(rf"^(?:{spare_type_source})$", re.I)
+    spare_inline = re.compile(
+        rf"^(?P<name>{spare_type_source})\s+(?P<model>.+?)\s+(?P<qty>\d+(?:\.\d+)?)\s+(?P<unit>块|台|套|个|只|组)$",
+        re.I,
+    )
+    spare_active = False
+    for page in pages:
+        lines = [re.sub(r"\s+", " ", line).strip() for line in page.text.splitlines() if line.strip()]
+        start = 0
+        if any("现场备件库清单" in line for line in lines):
+            spare_active = True
+            start = next((i + 1 for i, line in enumerate(lines) if "现场备件库清单" in line), 0)
+        if not spare_active:
+            continue
+        end = next((i for i, line in enumerate(lines[start:], start) if "乙方需建立" in line), len(lines))
+        body = [line for line in lines[start:end]
+                if line not in {"备件类型", "备件参数", "数量", "单位"}
+                and not re.match(r"^第\d+页共\d+页$", line.replace(" ", ""))
+                and not re.fullmatch(r"[A-Z]{2,}\d+[A-Z0-9]*", line)]
+        i = 0
+        while i < len(body):
+            inline = spare_inline.fullmatch(body[i])
+            if inline:
+                name = re.sub(r"\s+", " ", inline.group("name")).strip()
+                model = inline.group("model").strip()
+                qty = float(inline.group("qty"))
+                unit = inline.group("unit")
+                ev_id = f"EV-{project}-{direction}-ITEM-{len(items)+1:04d}"
+                quote = f"现场备件库清单：{name}，参数/型号{model}，数量{qty:g}{unit}"
+                evidence.append(EvidenceRef(ev_id, project, direction, "现场备件库清单", name,
+                                            page.file_name, page.page, quote, page.method,
+                                            page.confidence or "", bool(page.confidence and page.confidence < .9)))
+                items.append(EquipmentItem("备件", name, name, "", model, unit, qty,
+                                           {"备件参数": model}, direction, ev_id,
+                                           float(page.confidence or .9), "现场备件库清单"))
+                i += 1
+                continue
+            if not spare_types.fullmatch(body[i]):
+                i += 1
+                continue
+            qty_at = next((j for j in range(i + 2, min(i + 7, len(body) - 1))
+                           if re.fullmatch(r"\d+(?:\.\d+)?", body[j])
+                           and re.fullmatch(r"块|台|套|个|只|组", body[j + 1])), None)
+            if qty_at is None:
+                i += 1
+                continue
+            name = re.sub(r"\s+", " ", body[i]).strip()
+            model = " ".join(body[i + 1:qty_at]).strip()
+            qty = float(body[qty_at])
+            unit = body[qty_at + 1]
+            ev_id = f"EV-{project}-{direction}-ITEM-{len(items)+1:04d}"
+            quote = f"现场备件库清单：{name}，参数/型号{model}，数量{qty:g}{unit}"
+            evidence.append(EvidenceRef(ev_id, project, direction, "现场备件库清单", name,
+                                        page.file_name, page.page, quote, page.method,
+                                        page.confidence or "", bool(page.confidence and page.confidence < .9)))
+            items.append(EquipmentItem("备件", name, name, "", model, unit, qty,
+                                       {"备件参数": model}, direction, ev_id,
+                                       float(page.confidence or .9), "现场备件库清单"))
+            i = qty_at + 2
+        if end < len(lines):
+            spare_active = False
     return items
 
 
@@ -135,24 +295,44 @@ def _extract_time_plan(project: str, direction: str, pages: list[PageText], resu
                        evidence: list[EvidenceRef]) -> TimePlan:
     candidates: list[tuple[PageText, str]] = []
     for page in pages:
-        for match in re.finditer(r"工期|建设周期|实施周期|履行时间\s*[（(]?期限[）)]?|履行期限|服务期限|合同期限", page.text):
+        for match in re.finditer(r"工期|建设周期|实施周期|履行时间\s*[（(]?期限[）)]?|履行期限|服务期(?:限)?|合同期限", page.text):
             candidates.append((page, _sentence(page.text, match.start())))
     duration_value = None
     duration_unit = ""
     duration_raw = ""
     calculation_status = "合同未约定具体工期"
     duration_conclusion = "未明确：合同未约定具体工期"
+    fixed_period = False
+    start_date: str | None = None
+    finish_date: str | None = None
     for page, sentence in candidates:
-        normalized_page = re.sub(r"\s+", "", page.text)
         normalized = re.sub(r"\s+", "", sentence)
-        search_text = normalized_page
+        search_text = normalized
+        period = re.search(
+            r"(?:服务期|服务期限|合同期限)(?:为|：|:)?"
+            r"(20\d{2})年(\d{1,2})月(\d{1,2})日至"
+            r"(20\d{2})年(\d{1,2})月(\d{1,2})日"
+            r"(?:，?共计(\d{1,3})个?月)?", search_text)
         external = re.search(r"(?:履行时间[（(]?期限[）)]?|履行期限|服务期限|合同期限|工期).{0,60}?按.{0,50}?"
                              r"(?:招标文件|投标文件|采购文件|技术规范书|任务书|订单).{0,30}?(?:执行|为准)", search_text)
         other_contract_terms = re.search(
             r"(?:(?:工期|履行期限|履行时间[（(]?期限[）)]?).{0,80}?)?"
             r"((?:供货要求等)?(?:相关)?合同文件另有约定)", search_text)
         placeholder = re.search(r"[\[〔【（(]([^\]〕】）)]+)[\]〕】）)]\s*(工作日|日历天|天|日|个月|月|年)", search_text)
-        explicit = re.search(r"(?:工期(?:为|共|：|:)?|周期(?:为|共|：|:)?|应于.{0,30}?(?:后|内))\s*(?:不超过|不少于|不多于|至多)?\s*([0-9]{1,4}|[一二两三四五六七八九十]{1,3})\s*(个?工作日|日历天|天|日|个月|月|年)", search_text)
+        explicit = re.search(r"(?:工期(?:为|共|：|:)?|周期(?:为|共|：|:)?|服务期(?:限)?(?:为|共|：|:)?|应于.{0,30}?(?:后|内))\s*(?:不超过|不少于|不多于|至多)?\s*([0-9]{1,4}|[一二两三四五六七八九十]{1,3})\s*(个?工作日|日历天|天|日|个月|月|年)", search_text)
+        if period:
+            start_date = f"{int(period.group(1)):04d}-{int(period.group(2)):02d}-{int(period.group(3)):02d}"
+            finish_date = f"{int(period.group(4)):04d}-{int(period.group(5)):02d}-{int(period.group(6)):02d}"
+            period_start = date.fromisoformat(start_date)
+            period_finish = date.fromisoformat(finish_date)
+            duration_value = int(period.group(7)) if period.group(7) else max(
+                1, (period_finish.year - period_start.year) * 12 + period_finish.month - period_start.month)
+            duration_unit = "个月"
+            duration_raw = sentence
+            duration_conclusion = f"固定服务期：{start_date}至{finish_date}（{duration_value}个月）"
+            calculation_status = "合同约定了固定履约起止日期"
+            fixed_period = True
+            break
         if external:
             raw_pos = page.text.find("履行")
             if raw_pos < 0:
@@ -195,16 +375,18 @@ def _extract_time_plan(project: str, direction: str, pages: list[PageText], resu
             calculation_status = "合同未量化工期，需双方另行确认建设周期"
             duration_conclusion = "未明确：建设周期需双方另行确认"
 
-    start_type = str(result.get("工期起算方式") or "没有明确")
+    start_type = "固定日期区间" if fixed_period else str(result.get("工期起算方式") or "没有明确")
     start_text = str(result.get("工期起算条件原文") or "")
     joined = "\n".join(p.text for p in pages)
-    if re.search(r"合同(?:签订|签署)(?:后|之日|之日起)", joined):
+    if fixed_period:
+        start_text = duration_raw
+    elif re.search(r"合同(?:签订|签署)(?:后|之日|之日起)", joined):
         start_type = "合同签订开始"
         start_text = duration_raw if "合同签" in duration_raw else next((s for _, s in candidates if "合同签" in s), start_text)
     elif re.search(r"(?:收到|接到).{0,12}开工令", joined):
         start_type = "收到开工令开始"
-    start_date = str(result.get("工期起算具体日期") or "") or None
-    finish_date = str(result.get("预计结束日期") or "") or None
+    start_date = start_date if fixed_period else (str(result.get("工期起算具体日期") or "") or None)
+    finish_date = finish_date if fixed_period else (str(result.get("预计结束日期") or "") or None)
     if duration_value is None:
         finish_date = None
     if start_date and duration_value and not finish_date and duration_unit in {"日", "天", "工作日", "日历天", "个工作日"}:
@@ -272,8 +454,17 @@ def analysis_to_structured(project: str, direction: str, output: ContractOutput)
     plan = _extract_time_plan(project, direction, output.pages, result, evidence)
     kind = str(result.get("合同性质") or "无法确定")
     procurement_hit = any(PROCUREMENT_HINT_RE.search(page.text) for page in output.pages)
-    if equipment:
-        procurement_involved, procurement_note = True, f"涉及设备/材料采购，已提取{len(equipment)}项清单内容"
+    purchase_items = [item for item in equipment if item.list_type == "采购交付清单"]
+    service_items = [item for item in equipment if item.list_type in {"维保/服务对象清单", "现场备件库清单"}]
+    if purchase_items:
+        procurement_involved, procurement_note = True, f"涉及设备/材料采购，已提取{len(purchase_items)}项采购交付清单"
+    elif service_items:
+        resource_count = sum(item.list_type == "维保/服务对象清单" for item in service_items)
+        spare_count = sum(item.list_type == "现场备件库清单" for item in service_items)
+        procurement_involved, procurement_note = False, (
+            f"不涉及货物采购；已提取{resource_count}项维保/服务对象资源和{spare_count}项现场备件要求，"
+            "用于前后向覆盖分析"
+        )
     elif procurement_hit:
         procurement_involved, procurement_note = True, "合同提及设备/材料采购或报价清单，但未可靠提取到明细，需人工复核"
     else:

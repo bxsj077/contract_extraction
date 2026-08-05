@@ -137,10 +137,24 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
             temporary.unlink(missing_ok=True)
             await upload.close()
 
+    async def save_plan_file(upload: UploadFile, target: Path) -> None:
+        if not upload.filename or Path(upload.filename).suffix.lower() not in {".xls", ".xlsx", ".xml"}:
+            raise HTTPException(400, "收入/收款计划必须为XLS、XLSX或Excel XML文件")
+        temporary = target.with_suffix(target.suffix + ".uploading")
+        try:
+            with temporary.open("wb") as stream:
+                while chunk := await upload.read(1024 * 1024):
+                    stream.write(chunk)
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+            await upload.close()
+
     @app.post("/api/projects/upload")
     async def upload_project(background_tasks: BackgroundTasks, project_code: str = Form(...),
                              forward_pdfs: list[UploadFile] = File(...),
-                             backward_pdfs: list[UploadFile] = File(...), overwrite: bool = Query(False),
+                             backward_pdfs: list[UploadFile] = File(...),
+                             income_plan_files: list[UploadFile] | None = File(None), overwrite: bool = Query(False),
                              process_now: bool = Query(True)):
         code = project_code.strip()
         if not code or len(code) > 100 or re.search(r"[\\/:*?\"<>|]", code) or code in {".", ".."}:
@@ -153,9 +167,11 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
             raise HTTPException(409, "项目已存在；如需替换，请勾选覆盖已有项目")
         forward_dir = folder / "前向"
         backward_dir = folder / "后向"
+        plan_dir = folder / "收入收款计划"
         if overwrite:
             shutil.rmtree(forward_dir, ignore_errors=True)
             shutil.rmtree(backward_dir, ignore_errors=True)
+            shutil.rmtree(plan_dir, ignore_errors=True)
         forward_dir.mkdir(parents=True, exist_ok=True)
         backward_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -173,12 +189,22 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
                 if target.exists():
                     target = backward_dir / f"{index:03d}_{name}"
                 await save_pdf(upload, target); backward_paths.append(str(target))
+            plan_paths = []
+            if income_plan_files:
+                plan_dir.mkdir(parents=True, exist_ok=True)
+                for index, upload in enumerate(income_plan_files, 1):
+                    name = re.sub(r"[\\/:*?\"<>|]", "_", Path(upload.filename or f"收入收款计划_{index}.xlsx").name)
+                    target = plan_dir / name
+                    if target.exists():
+                        target = plan_dir / f"{index:03d}_{name}"
+                    await save_plan_file(upload, target); plan_paths.append(str(target))
         except Exception:
             if not any(folder.iterdir()):
                 shutil.rmtree(folder, ignore_errors=True)
             raise
         payload = {"项目编码": code, "项目目录": str(folder), "前向文件": forward_paths,
-                   "后向合同": backward_paths, "后向合同数量": len(backward_paths), "处理状态": "已上传"}
+                   "后向合同": backward_paths, "后向合同数量": len(backward_paths),
+                   "收入收款计划": plan_paths, "处理状态": "已上传"}
         if process_now:
             task_id = uuid.uuid4().hex
             update_task(task_id, project_code=code, status="排队中",

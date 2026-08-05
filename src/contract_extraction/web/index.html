@@ -43,7 +43,7 @@
     <section id="view-upload" class="view">
       <div class="page-head"><div><h1>上传合同</h1><p>以一个前向合同编号建立项目，并一次上传前向附件和多份后向合同。</p></div></div>
       <section class="panel"><div class="steps"><div class="step"><b>1</b>填写前向合同编号</div><div class="step"><b>2</b>选择前向及后向PDF</div><div class="step"><b>3</b>上传后自动解析</div></div>
-        <form id="uploadForm"><div class="upload-grid"><div class="field"><label>前向合同编号（项目编码）</label><input name="project_code" required placeholder="例如 JSNJA2513970CGN00"></div><div class="field"><label>前向合同及附件（可多选）</label><input type="file" name="forward_pdfs" accept="application/pdf,.pdf" multiple required></div><div class="field"><label>后向合同（可多选）</label><input type="file" name="backward_pdfs" accept="application/pdf,.pdf" multiple required></div></div>
+        <form id="uploadForm"><div class="upload-grid"><div class="field"><label>前向合同编号（项目编码）</label><input name="project_code" required placeholder="例如 JSNJA2513970CGN00"></div><div class="field"><label>前向合同及附件（可多选）</label><input type="file" name="forward_pdfs" accept="application/pdf,.pdf" multiple required></div><div class="field"><label>后向合同（可多选）</label><input type="file" name="backward_pdfs" accept="application/pdf,.pdf" multiple required></div><div class="field"><label>收入/收款计划（可选）</label><input type="file" name="income_plan_files" accept=".xls,.xlsx,.xml" multiple></div></div>
           <div class="checks"><label><input id="overwrite" type="checkbox"> 覆盖同项目已有文件</label><label><input id="processNow" type="checkbox" checked> 上传后立即解析和审查</label></div><button id="uploadButton" type="submit">上传合同并建立项目</button><span id="progress"></span><div id="message" class="message"></div></form>
       </section>
     </section>

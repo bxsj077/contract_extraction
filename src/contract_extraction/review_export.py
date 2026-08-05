@@ -28,7 +28,7 @@ HEADER_CN = {
     "procurement_involved": "是否涉及货物采购", "procurement_note": "货物采购说明",
     "standard_name": "标准名称", "original_name": "合同原始名称", "brand": "品牌",
     "model": "型号规格", "unit": "单位", "quantity": "数量", "technical_parameters": "技术参数",
-    "evidence_id": "证据编号", "confidence": "提取置信度",
+    "evidence_id": "证据编号", "confidence": "提取置信度", "list_type": "清单性质",
     "category": "差异类别", "status": "判断结果", "risk_level": "风险等级", "rule_id": "规则编号",
     "title": "审查事项", "description": "风险说明", "forward": "前向结构化内容",
     "backward": "后向结构化内容", "evidence_ids": "证据编号", "needs_review": "是否需人工复核",
@@ -98,51 +98,93 @@ def _add_sheet(wb: Workbook, title: str, rows: list[dict[str, Any]]) -> None:
         for cell in row:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
     for row_number in range(2, ws.max_row + 1):
-        ws.row_dimensions[row_number].height = 90
+        ws.row_dimensions[row_number].height = 42
     for i, h in enumerate(headers, 1):
-        ws.column_dimensions[get_column_letter(i)].width = min(max(12, len(h) * 2), 42)
+        ws.column_dimensions[get_column_letter(i)].width = min(max(12, len(h) * 2), 35)
 
 
 def export_review(store: ReviewStore, path: Path) -> Path:
     projects = [item["payload"] for item in store.list_projects()]
-    summary = []
-    contracts = []
-    equipment = []; equipment_items = []; schedules = []; scopes = []; timeline = []; parse_statuses = []
+    summary: list[dict[str, Any]] = []
+    contracts: list[dict[str, Any]] = []
+    time_reviews: list[dict[str, Any]] = []
+    equipment_rows: list[dict[str, Any]] = []
+    scopes: list[dict[str, Any]] = []
+    review_rows: list[dict[str, Any]] = []
     for p in projects:
+        equipment_differences = p.get("equipment_differences", [])
+        equipment_risk_count = sum(d.get("risk_level") not in {"", "无风险"} for d in equipment_differences)
         summary.append({"项目编码": p["project_code"], "处理状态": p["status"], "风险等级": p["risk_level"],
-                        "设备差异数": len(p.get("equipment_differences", [])), "工期风险数": len(p.get("schedule_differences", [])),
-                        "实施差异数": len(p.get("scope_differences", [])), "待复核数": len(p.get("review_issues", [])), "处理时间": p.get("processed_at", "")})
+                        "设备风险数": equipment_risk_count,
+                        "前后向完全覆盖项数": sum(d.get("status") == "完全覆盖" for d in equipment_differences),
+                        "后向备件要求项数": sum(d.get("status") == "后向新增备件要求" for d in equipment_differences),
+                        "工期风险数": len(p.get("schedule_differences", [])),
+                        "收入收款计划差异数": len(p.get("plan_differences", [])),
+                        "实施差异数": len(p.get("scope_differences", [])), "待复核数": len(p.get("review_issues", [])),
+                        "处理时间": p.get("processed_at", "")})
+        difference_by_evidence: dict[str, dict[str, Any]] = {}
+        for difference in equipment_differences:
+            for evidence_id in difference.get("evidence_ids", []):
+                difference_by_evidence[evidence_id] = difference
         individual_contracts = ([p["forward"]] if p.get("forward") else []) + p.get("backward_contracts", [])
         for contract in individual_contracts:
             if contract:
-                row = {"项目编码": p["project_code"], "合同方向": contract.get("direction", "")}
-                _flatten("", {k: v for k, v in contract.items() if k not in {"equipment", "scopes", "evidence"}}, row)
-                if "time_plan.duration_conclusion" in row:
-                    conclusion = row.pop("time_plan.duration_conclusion")
-                    reordered = {}
-                    for key, value in row.items():
-                        reordered[key] = value
-                        if key == "time_plan.duration_unit":
-                            reordered["time_plan.duration_conclusion"] = conclusion
-                    row = reordered
-                contracts.append(row)
+                plan = contract.get("time_plan", {})
+                details = plan.get("milestone_details", {})
+                metadata = contract.get("parse_metadata", {})
+                contracts.append({
+                    "项目编码": p["project_code"], "合同方向": contract.get("direction", ""),
+                    "合同编号": contract.get("contract_number", ""), "合同名称": contract.get("contract_name", ""),
+                    "甲方": contract.get("party_a", ""), "乙方": contract.get("party_b", ""),
+                    "签订日期": contract.get("sign_date", ""), "生效日期": contract.get("effective_date", ""),
+                    "合同性质": contract.get("contract_type", ""), "货物采购说明": contract.get("procurement_note", ""),
+                    "工期数值": plan.get("duration_value"), "工期单位": plan.get("duration_unit", ""),
+                    "工期提取结论": plan.get("duration_conclusion", ""), "合同履约起始日期": plan.get("start_date", ""),
+                    "合同履约截止日期": plan.get("finish_date", ""), "起算条件": plan.get("start_condition_type", ""),
+                    "工期约定原文": plan.get("duration_raw", ""), "工期计算状态": plan.get("calculation_status", ""),
+                    "到货节点": _cell_value(details.get("到货", {})), "初验节点": _cell_value(details.get("初验", {})),
+                    "终验节点": _cell_value(details.get("终验", {})),
+                    "服务内容": contract.get("key_clauses", {}).get("服务内容", ""),
+                    "乙方义务": contract.get("key_clauses", {}).get("乙方义务", ""),
+                    "其他关键条款": contract.get("key_clauses", {}).get("关键条款", ""),
+                    "页数": metadata.get("page_count", 0), "OCR错误数": metadata.get("ocr_error_count", 0),
+                    "解析状态": metadata.get("parse_status", "未知")})
                 if contract.get("equipment"):
                     for item in contract["equipment"]:
-                        equipment_items.append({"项目编码": p["project_code"], "合同方向": contract.get("direction", ""),
-                            "合同名称": contract.get("contract_name", ""), **item, "货物采购说明": contract.get("procurement_note", "")})
+                        difference = difference_by_evidence.get(item.get("evidence_id", ""), {})
+                        equipment_rows.append({
+                            "记录类型": "清单项", "项目编码": p["project_code"],
+                            "合同方向": contract.get("direction", ""), "合同名称": contract.get("contract_name", ""),
+                            "清单性质": item.get("list_type", "采购交付清单"), "类别": item.get("category", ""),
+                            "标准名称": item.get("standard_name", ""), "合同原始名称": item.get("original_name", ""),
+                            "品牌": item.get("brand", ""), "型号规格": item.get("model", ""),
+                            "单位": item.get("unit", ""), "数量": item.get("quantity"),
+                            "技术参数": item.get("technical_parameters", {}),
+                            "判断结果": difference.get("status", "待匹配"),
+                            "风险等级": difference.get("risk_level", "待确认"),
+                            "风险说明": difference.get("description", "未形成可靠差异判断"),
+                            "证据编号": item.get("evidence_id", ""), "提取置信度": item.get("confidence"),
+                            "货物采购说明": contract.get("procurement_note", ""),
+                        })
                 else:
-                    equipment_items.append({"项目编码": p["project_code"], "合同方向": contract.get("direction", ""),
+                    equipment_rows.append({"记录类型": "清单提取说明", "项目编码": p["project_code"], "合同方向": contract.get("direction", ""),
                         "合同名称": contract.get("contract_name", ""), "清单提取结果": "无清单项",
                         "货物采购说明": contract.get("procurement_note", "")})
-        for target, key in ((equipment, "equipment_differences"), (schedules, "schedule_differences"), (scopes, "scope_differences")):
-            target.extend({"项目编码": p["project_code"], **d} for d in p.get(key, []))
-        timeline.extend({"项目编码": p["project_code"], **x} for x in p.get("timeline", []))
-        parse_statuses.extend({"项目编码": p["project_code"], **x} for x in p.get("contract_parse_statuses", []))
+        time_reviews.extend({"记录类型": "前后向工期/节点", "项目编码": p["project_code"], **d}
+                            for d in p.get("schedule_differences", []))
+        time_reviews.extend({"记录类型": "收入收款计划复核", "项目编码": p["project_code"], **d}
+                            for d in p.get("plan_differences", []))
+        scopes.extend({"项目编码": p["project_code"], **d} for d in p.get("scope_differences", []))
+        review_rows.extend({"记录类型": "待人工复核", "项目编码": p["project_code"], **x}
+                           for x in p.get("review_issues", []))
+    review_rows.extend({"记录类型": "人工纠正", **x} for x in store.list_corrections())
     wb = Workbook(); wb.remove(wb.active)
-    for title, rows in (("项目处理汇总", summary), ("合同解析状态", parse_statuses), ("前后向合同解析结果", contracts),
-                        ("设备材料清单", equipment_items), ("设备材料差异", equipment),
-                        ("工期衔接风险", schedules), ("实施内容差异", scopes), ("项目时间轴", timeline),
-                        ("人工纠正记录", store.list_corrections()), ("待人工复核", store.list_issues())):
+    sheet_rows = [("项目审查汇总", summary), ("合同解析结果", contracts),
+                  ("时间及收入计划复核", time_reviews), ("设备清单及差异", equipment_rows)]
+    if scopes:
+        sheet_rows.append(("实施内容差异", scopes))
+    sheet_rows.append(("待复核及人工纠正", review_rows))
+    for title, rows in sheet_rows:
         _add_sheet(wb, title, rows)
     path.parent.mkdir(parents=True, exist_ok=True); wb.save(path)
     return path

@@ -13,6 +13,7 @@ class ProjectFiles:
     extra_pdfs: list[str] = field(default_factory=list)
     status: str = "待处理"
     issues: list[str] = field(default_factory=list)
+    revenue_plan_files: list[str] = field(default_factory=list)
 
     @property
     def forward_pdf(self) -> str | None:
@@ -51,6 +52,7 @@ class EquipmentItem:
     direction: str = ""
     evidence_id: str = ""
     confidence: float = 0.0
+    list_type: str = "采购交付清单"
 
 
 @dataclass(slots=True)
@@ -138,6 +140,7 @@ class ProjectReviewResult:
     processed_at: str = ""
     backward_contracts: list[ContractStructured] = field(default_factory=list)
     contract_parse_statuses: list[dict[str, Any]] = field(default_factory=list)
+    plan_differences: list[Difference] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

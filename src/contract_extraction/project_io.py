@@ -7,6 +7,7 @@ from .system_models import ProjectFiles
 
 FORWARD_DIR = "前向"
 BACKWARD_DIR = "后向"
+REVENUE_PLAN_DIR = "收入收款计划"
 LEGACY_FORWARD = "前向合同.pdf"
 LEGACY_BACKWARD = "后向合同.pdf"
 IGNORED_DIRS = {"_合同提取结果", "_履约风险审查结果", "output", "outputs", "ocr_cache", "review_output", "data"}
@@ -18,6 +19,13 @@ def _pdfs(folder: Path) -> list[str]:
     return [str(p) for p in sorted(folder.rglob("*")) if p.is_file() and p.suffix.lower() == ".pdf"]
 
 
+def _plan_files(folder: Path) -> list[str]:
+    if not folder.exists() or not folder.is_dir():
+        return []
+    return [str(p) for p in sorted(folder.rglob("*"))
+            if p.is_file() and p.suffix.lower() in {".xls", ".xlsx", ".xml"}]
+
+
 def _looks_like_project(folder: Path) -> bool:
     return (folder / FORWARD_DIR).is_dir() or (folder / BACKWARD_DIR).is_dir() or \
            (folder / LEGACY_FORWARD).is_file() or (folder / LEGACY_BACKWARD).is_file()
@@ -26,6 +34,7 @@ def _looks_like_project(folder: Path) -> bool:
 def _build_project(folder: Path) -> ProjectFiles:
     forward = _pdfs(folder / FORWARD_DIR)
     backward = _pdfs(folder / BACKWARD_DIR)
+    revenue_plans = _plan_files(folder / REVENUE_PLAN_DIR)
     legacy_forward = folder / LEGACY_FORWARD
     legacy_backward = folder / LEGACY_BACKWARD
     if not forward and legacy_forward.is_file():
@@ -47,7 +56,7 @@ def _build_project(folder: Path) -> ProjectFiles:
     if extras:
         issues.append(f"项目根目录存在{len(extras)}个未归入前向/后向的PDF")
     status = "可对比" if forward and backward else ("可解析单份合同" if forward or backward else "项目处理失败")
-    return ProjectFiles(folder.name, str(folder), forward, backward, extras, status, issues)
+    return ProjectFiles(folder.name, str(folder), forward, backward, extras, status, issues, revenue_plans)
 
 
 def scan_projects(root: Path, wanted: set[str] | None = None) -> list[ProjectFiles]:
