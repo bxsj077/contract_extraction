@@ -108,26 +108,68 @@ def _add_sheet(wb: Workbook, title: str, rows: list[dict[str, Any]]) -> None:
         ws.column_dimensions[get_column_letter(i)].width = min(max(12, len(h) * 2), 35)
 
 
+NO_CONTRACT_RULE = "合同中无明确规定"
+
+
+def _compact_clause(value: Any, max_length: int = 46) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(r"^未明确[：:]\s*", "", text)
+    if not text or re.match(r"^(合同未约定|合同中无明确规定|未提取)", text):
+        return NO_CONTRACT_RULE
+    text = re.sub(r"[（(]需查阅[^）)]*[）)]", "", text).strip()
+    parts = [part.strip() for part in re.split(r"[。；;]", text) if part.strip()]
+    result = parts[0] if parts else text
+    return result if len(result) <= max_length else result[:max_length] + "…"
+
+
 def _duration_display(plan: dict[str, Any]) -> str:
-    """Return one business-facing duration value without losing textual clauses."""
+    """Return only amount+unit, or one concise non-numeric requirement."""
     value = plan.get("duration_value")
     unit = str(plan.get("duration_unit") or "").strip()
     if value not in (None, ""):
         if isinstance(value, float) and value.is_integer():
             value = int(value)
         return f"{value}{unit}"
-    return str(plan.get("duration_conclusion") or plan.get("duration_raw") or "").strip()
+    return _compact_clause(plan.get("duration_conclusion") or plan.get("duration_raw"))
 
 
-def _milestone_summary(plan: dict[str, Any], node: str) -> tuple[str, str, str]:
+def _milestone_requirement(raw: str, node: str, status: str) -> str:
+    if re.search(r"时间异常|日期异常|早于项目起算|早于.*完工", status):
+        return NO_CONTRACT_RULE
+    text = re.sub(r"\s+", "", raw or "")
+    relative_patterns = (
+        r"((?:子)?合同(?:签订|签署|生效)(?:后|之日起)\d+(?:个?工作日|日历日|日历天|天|日|个月|月|年)(?:内)?)",
+        r"((?:收到|接到).{0,12}?(?:开工令|通知)(?:后|之日起)\d+(?:个?工作日|日历日|日历天|天|日|个月|月|年)(?:内)?)",
+        rf"((?:到货|交货|初验|终验|项目完工)(?:后|之日起)\d+(?:个?工作日|日历日|日历天|天|日|个月|月|年)(?:内)?)",
+    )
+    for pattern in relative_patterns:
+        if match := re.search(pattern, text):
+            return match.group(1)
+    if re.search(r"(?:供货|交货)(?:结束|完成)?并(?:初步验收|初验)合格后", text):
+        return "供货完成并初验合格后（未明确日期）"
+    if re.search(r"(?:供货|交货)(?:结束|完成)后", text):
+        return "供货完成后（未明确日期）"
+    if status and not re.search(r"合同未约定|未提取", status):
+        return f"合同提及{node}，未明确日期"
+    return NO_CONTRACT_RULE
+
+
+def _milestone_summary(plan: dict[str, Any], node: str) -> tuple[str, str]:
     detail = (plan.get("milestone_details") or {}).get(node, {}) or {}
     relative = str(detail.get("相对期限") or "").strip()
     raw_calculated = str(detail.get("计算日期") or (plan.get("milestones") or {}).get(node, "") or "").strip()
     calculated = raw_calculated if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", raw_calculated) else ""
     status = str(detail.get("计算状态") or "合同未约定该节点").strip()
-    clear = "明确" if relative or calculated or status.startswith(("有明确", "已按")) else "未明确"
-    requirement = relative or calculated or (raw_calculated if raw_calculated else status)
-    return clear, requirement, calculated
+    if calculated:
+        return calculated, calculated
+    if relative:
+        return _compact_clause(relative), ""
+    raw = str(detail.get("原文") or "").strip()
+    if raw:
+        return _milestone_requirement(raw, node, status), ""
+    if status and not re.search(r"合同未约定|未提取", status):
+        return _milestone_requirement("", node, status), ""
+    return NO_CONTRACT_RULE, ""
 
 
 def _contract_time_row(project_code: str, direction: str, contract: dict[str, Any]) -> dict[str, Any]:
@@ -136,19 +178,17 @@ def _contract_time_row(project_code: str, direction: str, contract: dict[str, An
     if contract.get("contract_name") and contract.get("contract_number"):
         contract_label = f"{contract['contract_name']}（{contract['contract_number']}）"
     duration = _duration_display(plan)
-    duration_clear = "明确" if plan.get("duration_value") not in (None, "") or plan.get("fixed_deadline") else "未明确"
-    duration_summary = duration if duration.startswith(("明确：", "未明确：")) else f"{duration_clear}：{duration or '合同未约定具体工期'}"
     delivery = _milestone_summary(plan, "到货")
     preliminary = _milestone_summary(plan, "初验")
     final = _milestone_summary(plan, "终验")
     return {
         "项目编码": project_code, "合同方向": direction, "合同名称/编号": contract_label,
-        "签订日期": contract.get("sign_date", ""), "项目整体工期": duration_summary,
+        "签订日期": contract.get("sign_date") or NO_CONTRACT_RULE, "项目整体工期": duration,
         "开工起算方式": plan.get("start_condition_type", "没有明确"), "可计算开工日期": plan.get("start_date", ""),
         "可计算完工日期": plan.get("finish_date", ""),
-        "到货时间要求": f"{delivery[0]}：{delivery[1]}", "到货计算日期": delivery[2],
-        "初验时间要求": f"{preliminary[0]}：{preliminary[1]}", "初验计算日期": preliminary[2],
-        "终验时间要求": f"{final[0]}：{final[1]}", "终验计算日期": final[2],
+        "到货时间要求": delivery[0], "到货计算日期": delivery[1],
+        "初验时间要求": preliminary[0], "初验计算日期": preliminary[1],
+        "终验时间要求": final[0], "终验计算日期": final[1],
     }
 
 

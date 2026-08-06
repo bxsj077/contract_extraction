@@ -8,7 +8,8 @@ from openpyxl import load_workbook
 
 from contract_extraction.comparisons import compare_equipment, compare_schedule, compare_scopes
 from contract_extraction.api import create_app
-from contract_extraction.review_export import _header_cn, export_project_reviews, export_review
+from contract_extraction.review_export import (_contract_time_row, _duration_display, _header_cn,
+                                                _milestone_summary, export_project_reviews, export_review)
 from contract_extraction.review_service import ReviewService
 from contract_extraction.project_io import scan_projects
 from contract_extraction.revenue_plan import compare_income_collection_plan, extract_plan_nodes, extract_plan_periods
@@ -30,6 +31,42 @@ class ReviewSystemTests(unittest.TestCase):
             self.assertEqual(project.project_code, "000123")
             self.assertEqual(project.status, "可解析单份合同")
             self.assertIn("缺少后向合同", project.issues)
+
+    def test_contract_overview_uses_concise_time_display(self):
+        plan = {
+            "duration_value": 90,
+            "duration_unit": "天",
+            "milestones": {"到货": "2026-04-06"},
+            "milestone_details": {
+                "到货": {"计算日期": "2026-04-06", "原文": "很长的到货付款条款"},
+                "初验": {"计算状态": "合同未约定该节点", "原文": ""},
+                "终验": {"相对期限": "项目完工后30日内", "计算日期": ""},
+            },
+        }
+        self.assertEqual(_duration_display(plan), "90天")
+        self.assertEqual(_milestone_summary(plan, "到货"), ("2026-04-06", "2026-04-06"))
+        self.assertEqual(_milestone_summary(plan, "初验"), ("合同中无明确规定", ""))
+        self.assertEqual(_milestone_summary(plan, "终验"), ("项目完工后30日内", ""))
+        row = _contract_time_row("P1", "前向", {"contract_name": "示例合同", "time_plan": plan})
+        self.assertEqual(row["签订日期"], "合同中无明确规定")
+
+        plan["milestone_details"]["到货"] = {
+            "原文": "2、供货结束并初步验收合格后，甲方支付至合同总价款的70%。",
+            "相对期限": "",
+            "计算日期": "",
+            "计算状态": "合同提及该节点，但未明确时间",
+        }
+        plan["milestones"].pop("到货", None)
+        self.assertEqual(_milestone_summary(plan, "到货"),
+                         ("供货完成并初验合格后（未明确日期）", ""))
+
+        plan["milestone_details"]["到货"] = {
+            "原文": "交货后终验质保合格之日起3年，日期2026年1月27日",
+            "相对期限": "",
+            "计算日期": "",
+            "计算状态": "原识别日期早于项目起算或整体完工日期，已判定为时间异常",
+        }
+        self.assertEqual(_milestone_summary(plan, "到货"), ("合同中无明确规定", ""))
 
     def test_api_uses_explicit_storage_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -459,7 +496,7 @@ class ReviewSystemTests(unittest.TestCase):
             self.assertEqual(len(rows[0]), 14)
             duration_col = rows[0].index("项目整体工期")
             self.assertEqual([row[duration_col] for row in rows[1:]],
-                             ["明确：12个月", "未明确：按招标文件及投标文件执行"])
+                             ["12个月", "按招标文件及投标文件执行"])
             self.assertIn("设备未覆盖风险", sheet_names)
             self.assertEqual(equipment_rows[0], (
                 "项目编码", "前向设备名称", "前向品牌", "前向型号", "前向数量",
@@ -523,12 +560,29 @@ class ReviewSystemTests(unittest.TestCase):
         f, b = self.contract("前向"), self.contract("后向")
         f.time_plan = TimePlan(90, "日", "收到开工令", start_date="2026-01-01", finish_date="2026-04-01")
         b.time_plan = TimePlan(100, "日", "收到开工令", start_date="2026-01-01", finish_date="2026-04-11")
-        self.assertEqual(compare_schedule(f, b, 15)[0].status, "明确来不及")
+        result = compare_schedule(f, b, 15, "后向合同1")
+        self.assertEqual(result[0].status, "后向工期晚于前向")
+        self.assertEqual(result[0].risk_level, "高风险")
+        self.assertIn("后向晚10天", result[0].description)
 
     def test_schedule_missing_never_says_satisfied(self):
         result = compare_schedule(self.contract("前向"), self.contract("后向"))[0]
-        self.assertEqual(result.status, "缺少起算依据")
+        self.assertEqual(result.status, "工期日期待确认")
         self.assertTrue(result.needs_review)
+
+    def test_each_milestone_date_is_compared_directly(self):
+        f, b = self.contract("前向"), self.contract("后向")
+        f.time_plan = TimePlan(90, "天", start_date="2026-01-01", finish_date="2026-04-01",
+                               milestones={"到货": "2026-02-10", "初验": "2026-03-01", "终验": "2026-04-01"})
+        b.time_plan = TimePlan(80, "天", start_date="2026-01-01", finish_date="2026-03-22",
+                               milestones={"到货": "2026-02-20", "初验": "2026-02-25", "终验": "2026-04-06"})
+        result = compare_schedule(f, b, backward_label="后向合同1：测试合同")
+        by_title = {item.title.split("（", 1)[0]: item for item in result}
+        self.assertEqual(by_title["到货"].status, "后向到货晚于前向")
+        self.assertEqual(by_title["到货"].risk_level, "高风险")
+        self.assertIn("后向晚10天", by_title["到货"].description)
+        self.assertEqual(by_title["初验"].status, "后向初验不晚于前向")
+        self.assertEqual(by_title["终验"].status, "后向终验晚于前向")
 
     def test_responsibility_weakened(self):
         f, b = self.contract("前向"), self.contract("后向")

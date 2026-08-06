@@ -412,7 +412,12 @@ class ReviewService:
                 dismissed_equipment = self.store.dismissed_finding_keys(project.project_code, "equipment")
                 equipment = [item for item in equipment if finding_key("equipment", item) not in dismissed_equipment]
                 if "运维类" not in {forward.contract_type, backward.contract_type}:
-                    schedule = compare_schedule(forward, backward, int(self.config.get("safety_buffer_days", 15)))
+                    for index, backward_contract in enumerate(backward_contracts, 1):
+                        contract_name = backward_contract.contract_name or backward_contract.contract_number or f"后向合同{index}"
+                        schedule.extend(compare_schedule(
+                            forward, backward_contract, int(self.config.get("safety_buffer_days", 15)),
+                            f"后向合同{index}：{contract_name}",
+                        ))
                     scopes = compare_scopes(forward, backward)
                     schedule = self._apply_finding_overrides(project.project_code, "schedule", schedule)
                     scopes = self._apply_finding_overrides(project.project_code, "scope", scopes)

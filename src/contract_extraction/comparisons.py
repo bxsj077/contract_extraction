@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict
-from datetime import date, timedelta
+from datetime import date
 from difflib import SequenceMatcher
 
 from .system_models import ContractStructured, Difference, ScopeItem
@@ -105,35 +105,69 @@ def compare_equipment(forward: ContractStructured, backward: ContractStructured)
     return results
 
 
-def compare_schedule(forward: ContractStructured, backward: ContractStructured, buffer_days: int = 15) -> list[Difference]:
+def _schedule_date(plan, node: str) -> date | None:
+    if node == "工期":
+        raw = plan.finish_date
+    else:
+        detail = plan.milestone_details.get(node, {}) or {}
+        if re.search(r"时间异常|日期异常", str(detail.get("计算状态") or "")):
+            return None
+        raw = detail.get("计算日期") or plan.milestones.get(node)
+    try:
+        return date.fromisoformat(str(raw)) if raw else None
+    except ValueError:
+        return None
+
+
+def _schedule_requirement(plan, node: str) -> bool:
+    if node == "工期":
+        return bool(plan.duration_value is not None or plan.duration_raw or plan.duration_conclusion)
+    detail = plan.milestone_details.get(node, {}) or {}
+    return bool(detail.get("原文") or detail.get("相对期限") or detail.get("计算日期") or plan.milestones.get(node))
+
+
+def compare_schedule(forward: ContractStructured, backward: ContractStructured, buffer_days: int = 15,
+                     backward_label: str = "后向合同") -> list[Difference]:
     f, b = forward.time_plan, backward.time_plan
     evidence = f.evidence_ids + b.evidence_ids
-    if not all((f.start_date, f.duration_value, b.start_date, b.duration_value, f.finish_date, b.finish_date)):
-        result = [Difference("工期", "缺少起算依据", "待确认", "TM-001", "工期衔接",
-            f"前向：{f.calculation_status or '缺少可计算信息'}；后向：{b.calculation_status or '缺少可计算信息'}。",
-            asdict(f), asdict(b), evidence, True)]
-        for node in ("到货", "初验", "终验"):
-            fd = f.milestone_details.get(node, {})
-            bd = b.milestone_details.get(node, {})
-            result.append(Difference("时间节点", "节点时间待确认", "待确认", f"TM-{node}", node,
-                f"前向：{fd.get('计算状态', '未提取')}；后向：{bd.get('计算状态', '未提取')}。",
-                fd, bd, evidence, True))
-        return result
-    f_finish, b_finish = date.fromisoformat(f.finish_date), date.fromisoformat(b.finish_date)
-    control = f_finish - timedelta(days=buffer_days)
-    if b_finish <= control:
-        status, risk = "工期满足", "无风险"
-    elif b_finish <= f_finish:
-        status, risk = "工期紧张", "中风险"
-    else:
-        status, risk = "明确来不及", "高风险"
-    gap = (b_finish - control).days
-    result = [Difference("工期", status, risk, "TM-002", "工期衔接",
-        f"前向最晚完成{f_finish}，内部控制日期{control}，后向预计完成{b_finish}，相对控制日期差{gap}天。",
-        asdict(f), asdict(b), evidence)]
+    _ = buffer_days  # Kept for configuration/API compatibility; business rule now compares the contractual dates directly.
+    result: list[Difference] = []
+    for index, node in enumerate(("工期", "到货", "初验", "终验"), 1):
+        forward_date = _schedule_date(f, node)
+        backward_date = _schedule_date(b, node)
+        category = "工期" if node == "工期" else "时间节点"
+        title = f"{node}（{backward_label}）"
+        forward_payload = asdict(f) if node == "工期" else (f.milestone_details.get(node, {}) or {})
+        backward_payload = asdict(b) if node == "工期" else (b.milestone_details.get(node, {}) or {})
+        if forward_date and backward_date:
+            gap = (backward_date - forward_date).days
+            if gap > 0:
+                status, risk = f"后向{node}晚于前向", "高风险"
+                description = (f"前向{node}日期为{forward_date.isoformat()}，{backward_label}{node}日期为"
+                               f"{backward_date.isoformat()}，后向晚{gap}天，存在明确履约风险。")
+            else:
+                status, risk = f"后向{node}不晚于前向", "无风险"
+                lead = abs(gap)
+                description = (f"前向{node}日期为{forward_date.isoformat()}，{backward_label}{node}日期为"
+                               f"{backward_date.isoformat()}，后向{'提前' + str(lead) + '天' if lead else '与前向同日'}。")
+            result.append(Difference(category, status, risk, f"TM-{index:03d}", title, description,
+                                     forward_payload, backward_payload, evidence))
+            continue
+        forward_has = _schedule_requirement(f, node)
+        backward_has = _schedule_requirement(b, node)
+        if node != "工期" and not (forward_date or backward_date or forward_has or backward_has):
+            continue
+        missing_side = "前向和后向" if not forward_date and not backward_date else ("前向" if not forward_date else "后向")
+        description = (f"{missing_side}{node}缺少可靠的具体日期，暂不能判断{backward_label}是否晚于前向。"
+                       f"前向：{forward_date.isoformat() if forward_date else '无可计算日期'}；"
+                       f"后向：{backward_date.isoformat() if backward_date else '无可计算日期'}。")
+        result.append(Difference(category, f"{node}日期待确认", "待确认", f"TM-{index:03d}", title,
+                                 description, forward_payload, backward_payload, evidence, True))
     if f.start_condition_type != b.start_condition_type:
-        result.append(Difference("工期", "前后向时间条件不一致", "中风险", "TM-003", "起算条件",
-            f"前向为“{f.start_condition_type}”，后向为“{b.start_condition_type}”。", asdict(f), asdict(b), evidence))
+        result.append(Difference("工期", "前后向时间条件不一致", "中风险", "TM-005",
+            f"起算条件（{backward_label}）",
+            f"前向为“{f.start_condition_type}”，{backward_label}为“{b.start_condition_type}”。",
+            asdict(f), asdict(b), evidence))
     return result
 
 
