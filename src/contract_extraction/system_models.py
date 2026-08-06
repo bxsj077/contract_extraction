@@ -136,7 +136,7 @@ class ProjectReviewResult:
     scope_differences: list[Difference] = field(default_factory=list)
     timeline: list[dict[str, Any]] = field(default_factory=list)
     review_issues: list[dict[str, Any]] = field(default_factory=list)
-    rule_version: str = "2026.08-v11-procurement-delivery-milestones"
+    rule_version: str = "2026.08-v13-quantity-first-multi-backward"
     processed_at: str = ""
     backward_contracts: list[ContractStructured] = field(default_factory=list)
     contract_parse_statuses: list[dict[str, Any]] = field(default_factory=list)

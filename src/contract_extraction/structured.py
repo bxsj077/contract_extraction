@@ -9,7 +9,7 @@ from .models import ContractOutput, PageText
 from .system_models import ContractStructured, EquipmentItem, EvidenceRef, ScopeItem, TimePlan
 
 
-UNITS = "公斤|千克|千米|立方米|立方|平方米|千块|工作日|日历天|台|套|个|块|只|批|系统|项|组|路|点|端|授权|根|副|米|吨|年|月"
+UNITS = "公斤|千克|千米|立方米|立方|平方米|千块|工作日|日历天|台|套|个|块|只|批|系统|项|组|路|点|端|授权|根|副|张|条|米|吨|年|月"
 TABLE_UNIT_PATTERN = "|".join(r"\s*".join(re.escape(char) for char in unit) for unit in UNITS.split("|"))
 EQUIPMENT_RE = re.compile(rf"(?P<name>[\u4e00-\u9fffA-Za-z0-9\-（）()/.]{{2,45}}?)\s+(?:(?P<model>[A-Za-z][A-Za-z0-9._/\-]{{2,30}})\s+)?(?P<unit>{UNITS})\s*(?P<qty>\d+(?:\.\d+)?)")
 EQUIPMENT_WORDS = re.compile(r"交换机|服务器|防火墙|路由器|存储|软件|平台|系统|模块|终端|摄像机|授权|数据库|线缆|光纤|机柜|配电|网关|钢筋|电缆托架|积水罐|井盖|机制砖|粗砂|碎石|PVC|水泥|混凝土|管材|材料")
@@ -28,6 +28,11 @@ PRICE_TABLE_HEADER_RE = re.compile(
 )
 QUANTITY_FIRST_TABLE_HEADER_RE = re.compile(
     r"序\s*号.{0,30}名\s*称.{0,30}数\s*量.{0,20}单\s*位.{0,30}品\s*牌.{0,20}型\s*号",
+    re.S,
+)
+SIMPLE_PROCUREMENT_HEADER_RE = re.compile(
+    r"序\s*号.{0,30}采购\s*内容.{0,30}数\s*量.{0,20}单\s*位"
+    r"(?P<brand_model>.{0,30}品\s*牌.{0,20}型\s*号)?",
     re.S,
 )
 PROCUREMENT_HINT_RE = re.compile(r"(?:设备|材料|货物).{0,8}采购|采购.{0,8}(?:设备|材料|货物)|设备清单|材料清单|报价清单|明细报价表|主材|辅材|材料由.{0,10}提供")
@@ -160,6 +165,75 @@ def _cross_page_product_rows(
             rows.append({**row, "page": page})
         expected_row = page_rows[-1]["row_number"] + 1
         if re.search(r"以上合计|设备部分合计|总\s*计", page.text):
+            active = False
+    return rows, consumed
+
+
+def _simple_procurement_rows(
+        pages: list[PageText]) -> tuple[list[dict[str, Any]], set[tuple[str, int]]]:
+    """Parse compact 清单 tables ordered as 采购内容/数量/单位[/品牌/型号]."""
+    rows: list[dict[str, Any]] = []
+    consumed: set[tuple[str, int]] = set()
+    current_file = ""
+    active = False
+    expected_row = 1
+    has_brand_model = False
+    units = "台|套|个|块|只|批|系统|项|组|路|点|端|授权|根|副|张|条"
+
+    for page in pages:
+        if page.file_name != current_file:
+            current_file = page.file_name
+            active = False
+            expected_row = 1
+            has_brand_model = False
+        header = SIMPLE_PROCUREMENT_HEADER_RE.search(page.text)
+        if header and DESCRIPTIVE_PROCUREMENT_HEADER_RE.search(page.text):
+            header = None
+        if header:
+            active = True
+            expected_row = 1
+            has_brand_model = bool(re.search(r"品\s*牌.{0,30}型\s*号", page.text, re.S))
+        if not active:
+            continue
+        lines = [re.sub(r"\s+", " ", line).strip() for line in page.text.splitlines() if line.strip()]
+        starts: list[tuple[int, int, str]] = []
+        for index, line in enumerate(lines):
+            match = re.match(r"^(\d{1,3})\s+(.+)$", line)
+            if match and int(match.group(1)) == expected_row:
+                starts.append((index, expected_row, match.group(2)))
+                expected_row += 1
+        for row_index, (start, number, first) in enumerate(starts):
+            end = starts[row_index + 1][0] if row_index + 1 < len(starts) else min(len(lines), start + 8)
+            block = re.sub(r"\s+", " ", " ".join([first] + lines[start + 1:end])).split("]", 1)[0].strip()
+            parsed = re.match(
+                rf"^(?P<name>.+?)\s+(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>{units})"
+                r"(?:\s*/\s*\d*\s*年)?(?:\s+(?P<tail>.*))?$",
+                block,
+            )
+            if not parsed:
+                continue
+            name = _clean_table_text(parsed.group("name"))
+            tail = str(parsed.group("tail") or "").strip()
+            brand = model = ""
+            if has_brand_model and tail:
+                tokens = tail.split()
+                if len(tokens) >= 2 and tokens[0] == tokens[1] == "/":
+                    brand = model = "/"
+                elif tokens:
+                    brand = _clean_table_text(tokens[0])
+                    model = _clean_table_text(" ".join(tokens[1:])) if len(tokens) > 1 else ""
+            rows.append({
+                "row_number": number,
+                "name": name,
+                "brand": brand,
+                "model": model,
+                "quantity": float(parsed.group("qty")),
+                "unit": parsed.group("unit"),
+                "page": page,
+            })
+        if starts:
+            consumed.add((page.file_name, page.page))
+        if "]" in page.text or re.search(r"甲方\s*[：:]", page.text):
             active = False
     return rows, consumed
 
@@ -431,6 +505,26 @@ def _quantity_first_procurement_rows(
 def _extract_equipment(project: str, direction: str, pages: list[PageText], evidence: list[EvidenceRef]) -> list[EquipmentItem]:
     items: list[EquipmentItem] = []
     seen: set[tuple[str, str, float | None]] = set()
+    simple_rows, simple_pages = _simple_procurement_rows(pages)
+    for row in simple_rows:
+        page = row["page"]
+        name = row["name"]
+        qty = row["quantity"]
+        unit = row["unit"]
+        key = (name, row["model"], qty)
+        if key in seen:
+            continue
+        seen.add(key)
+        ev_id = f"EV-{project}-{direction}-ITEM-{len(items)+1:04d}"
+        quote = (f"采购清单第{row['row_number']}项：{name}，数量{qty:g}{unit}，"
+                 f"品牌{row['brand'] or '未列明'}，型号{row['model'] or '未列明'}")
+        evidence.append(EvidenceRef(ev_id, project, direction, "设备材料清单", name, page.file_name, page.page,
+                                    quote, page.method, page.confidence or "",
+                                    bool(page.confidence and page.confidence < .9)))
+        category = "软件/服务" if re.search(r"软件|平台|模块|算法|服务|实施|集成|运维|运营", name) else "设备"
+        items.append(EquipmentItem(category, name, name, row["brand"], row["model"], unit, qty,
+                                   {}, direction, ev_id, float(page.confidence or .9),
+                                   "采购交付清单"))
     product_rows, product_pages = _cross_page_product_rows(pages)
     for row in product_rows:
         page = row["page"]
@@ -524,6 +618,7 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
     procurement_section = ""
     for page in pages:
         if ((page.file_name, page.page) in product_pages
+                or (page.file_name, page.page) in simple_pages
                 or (page.file_name, page.page) in quantity_first_pages
                 or (page.file_name, page.page) in descriptive_pages
                 or (page.file_name, page.page) in price_pages):

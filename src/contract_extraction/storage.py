@@ -51,6 +51,13 @@ CREATE TABLE IF NOT EXISTS dismissed_findings (
   note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
   UNIQUE(project_code, category, finding_key)
 );
+CREATE TABLE IF NOT EXISTS finding_overrides (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, project_code TEXT NOT NULL,
+  category TEXT NOT NULL, finding_key TEXT NOT NULL, status TEXT NOT NULL,
+  risk_level TEXT NOT NULL, description TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  UNIQUE(project_code, category, finding_key)
+);
 """
 
 
@@ -222,9 +229,31 @@ class ReviewStore:
         with self.connect() as db:
             return {row[0] for row in db.execute(query, args).fetchall()}
 
+    def save_finding_override(self, project_code: str, category: str, finding: Any,
+                              status: str, risk_level: str, description: str,
+                              note: str = "") -> dict[str, Any]:
+        now = datetime.now().isoformat(timespec="seconds")
+        key = finding_key(category, finding)
+        with self.connect() as db:
+            db.execute("""INSERT INTO finding_overrides(
+                project_code,category,finding_key,status,risk_level,description,note,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(project_code,category,finding_key) DO UPDATE SET
+                status=excluded.status,risk_level=excluded.risk_level,description=excluded.description,
+                note=excluded.note,updated_at=excluded.updated_at""",
+                (project_code, category, key, status, risk_level, description, note, now, now))
+            row = db.execute("SELECT * FROM finding_overrides WHERE project_code=? AND category=? AND finding_key=?",
+                             (project_code, category, key)).fetchone()
+        return dict(row)
+
+    def finding_overrides(self, project_code: str, category: str) -> dict[str, dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM finding_overrides WHERE project_code=? AND category=?",
+                              (project_code, category)).fetchall()
+        return {row["finding_key"]: dict(row) for row in rows}
+
     def delete_project(self, project_code: str) -> dict[str, int]:
         """Delete every database record owned by one project in one transaction."""
-        tables = ("dismissed_findings", "field_corrections", "review_issues", "contracts", "tasks", "projects")
+        tables = ("finding_overrides", "dismissed_findings", "field_corrections", "review_issues", "contracts", "tasks", "projects")
         deleted: dict[str, int] = {}
         with self.connect() as db:
             for table in tables:

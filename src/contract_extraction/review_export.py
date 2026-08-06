@@ -119,6 +119,84 @@ def _duration_display(plan: dict[str, Any]) -> str:
     return str(plan.get("duration_conclusion") or plan.get("duration_raw") or "").strip()
 
 
+def _milestone_summary(plan: dict[str, Any], node: str) -> tuple[str, str, str]:
+    detail = (plan.get("milestone_details") or {}).get(node, {}) or {}
+    relative = str(detail.get("相对期限") or "").strip()
+    raw_calculated = str(detail.get("计算日期") or (plan.get("milestones") or {}).get(node, "") or "").strip()
+    calculated = raw_calculated if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", raw_calculated) else ""
+    status = str(detail.get("计算状态") or "合同未约定该节点").strip()
+    clear = "明确" if relative or calculated or status.startswith(("有明确", "已按")) else "未明确"
+    requirement = relative or calculated or (raw_calculated if raw_calculated else status)
+    return clear, requirement, calculated
+
+
+def _contract_time_row(project_code: str, direction: str, contract: dict[str, Any]) -> dict[str, Any]:
+    plan = contract.get("time_plan", {}) or {}
+    contract_label = contract.get("contract_name") or contract.get("contract_number") or "未识别合同名称"
+    if contract.get("contract_name") and contract.get("contract_number"):
+        contract_label = f"{contract['contract_name']}（{contract['contract_number']}）"
+    duration = _duration_display(plan)
+    duration_clear = "明确" if plan.get("duration_value") not in (None, "") or plan.get("fixed_deadline") else "未明确"
+    duration_summary = duration if duration.startswith(("明确：", "未明确：")) else f"{duration_clear}：{duration or '合同未约定具体工期'}"
+    delivery = _milestone_summary(plan, "到货")
+    preliminary = _milestone_summary(plan, "初验")
+    final = _milestone_summary(plan, "终验")
+    return {
+        "项目编码": project_code, "合同方向": direction, "合同名称/编号": contract_label,
+        "签订日期": contract.get("sign_date", ""), "项目整体工期": duration_summary,
+        "开工起算方式": plan.get("start_condition_type", "没有明确"), "可计算开工日期": plan.get("start_date", ""),
+        "可计算完工日期": plan.get("finish_date", ""),
+        "到货时间要求": f"{delivery[0]}：{delivery[1]}", "到货计算日期": delivery[2],
+        "初验时间要求": f"{preliminary[0]}：{preliminary[1]}", "初验计算日期": preliminary[2],
+        "终验时间要求": f"{final[0]}：{final[1]}", "终验计算日期": final[2],
+    }
+
+
+def _plan_review_row(project_code: str, difference: dict[str, Any]) -> dict[str, Any]:
+    plan, contract = difference.get("forward", {}) or {}, difference.get("backward", {}) or {}
+    plan_time = plan.get("财务计划日期", "")
+    if plan.get("计划起始日期") or plan.get("计划截止日期"):
+        plan_time = f"{plan.get('计划起始日期', '')}至{plan.get('计划截止日期', '')}"
+    gaps = []
+    if contract.get("偏差天数") is not None:
+        gaps.append(f"{contract['偏差天数']:+d}天")
+    if contract.get("开始偏差天数") is not None:
+        gaps.append(f"开始{contract['开始偏差天数']:+d}天")
+    if contract.get("截止偏差天数") is not None:
+        gaps.append(f"截止{contract['截止偏差天数']:+d}天")
+    source = "；".join(filter(None, (str(plan.get("来源文件") or ""), str(plan.get("来源工作表") or ""),
+                                     str(plan.get("日期字段") or ""))))
+    return {
+        "项目编码": project_code, "计划类型": plan.get("计划类型") or difference.get("title", ""),
+        "对应合同方向": contract.get("合同方向", ""),
+        "对应合同": contract.get("合同名称") or contract.get("合同编号", ""),
+        "复核节点": plan.get("复核节点") or difference.get("title", ""),
+        "财务计划时间（基准）": plan_time, "合同解析时间": contract.get("合同解析日期", ""),
+        "偏差": "；".join(gaps), "复核结论": difference.get("status", ""),
+        "风险等级": difference.get("risk_level", ""), "复核说明": difference.get("description", ""),
+        "计划来源": source,
+    }
+
+
+def _scope_summary(value: dict[str, Any]) -> str:
+    if not value:
+        return "未提取"
+    original = str(value.get("original_text") or "").strip()
+    if len(original) > 160:
+        original = original[:157] + "..."
+    return "；".join(filter(None, (str(value.get("responsibility") or ""), original)))
+
+
+def _scope_review_row(project_code: str, difference: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "项目编码": project_code, "主要实施环节": difference.get("title", ""),
+        "前向要求": _scope_summary(difference.get("forward", {}) or {}),
+        "后向安排": _scope_summary(difference.get("backward", {}) or {}),
+        "比对结论": difference.get("status", ""), "风险等级": difference.get("risk_level", ""),
+        "风险说明": difference.get("description", ""),
+    }
+
+
 def _safe_filename(value: str) -> str:
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip(" .") or "未命名项目"
 
@@ -137,32 +215,13 @@ def export_review(store: ReviewStore, path: Path, project_codes: set[str] | None
         summary.append({"项目编码": p["project_code"], "处理状态": p["status"], "风险等级": p["risk_level"],
                         "前向设备未覆盖数": len(equipment_differences),
                         "工期风险数": len(p.get("schedule_differences", [])),
-                        "收入收款计划差异数": len(p.get("plan_differences", [])),
-                        "实施差异数": len(p.get("scope_differences", [])), "待复核数": len(p.get("review_issues", [])),
+                        "收入收款计划复核项数": len(p.get("plan_differences", [])),
+                        "主要实施审查项数": len(p.get("scope_differences", [])), "待复核数": len(p.get("review_issues", [])),
                         "处理时间": p.get("processed_at", "")})
-        individual_contracts = ([p["forward"]] if p.get("forward") else []) + p.get("backward_contracts", [])
-        for contract in individual_contracts:
-            if contract:
-                plan = contract.get("time_plan", {})
-                details = plan.get("milestone_details", {})
-                metadata = contract.get("parse_metadata", {})
-                contracts.append({
-                    "项目编码": p["project_code"], "合同方向": contract.get("direction", ""),
-                    "合同编号": contract.get("contract_number", ""), "合同名称": contract.get("contract_name", ""),
-                    "甲方": contract.get("party_a", ""), "乙方": contract.get("party_b", ""),
-                    "签订日期": contract.get("sign_date", ""), "生效日期": contract.get("effective_date", ""),
-                    "合同性质": contract.get("contract_type", ""), "货物采购说明": contract.get("procurement_note", ""),
-                    "工期": _duration_display(plan),
-                    "工期提取结论": plan.get("duration_conclusion", ""), "合同履约起始日期": plan.get("start_date", ""),
-                    "合同履约截止日期": plan.get("finish_date", ""), "起算条件": plan.get("start_condition_type", ""),
-                    "工期约定原文": plan.get("duration_raw", ""), "工期计算状态": plan.get("calculation_status", ""),
-                    "到货节点": _cell_value(details.get("到货", {})), "初验节点": _cell_value(details.get("初验", {})),
-                    "终验节点": _cell_value(details.get("终验", {})),
-                    "服务内容": contract.get("key_clauses", {}).get("服务内容", ""),
-                    "乙方义务": contract.get("key_clauses", {}).get("乙方义务", ""),
-                    "其他关键条款": contract.get("key_clauses", {}).get("关键条款", ""),
-                    "页数": metadata.get("page_count", 0), "OCR错误数": metadata.get("ocr_error_count", 0),
-                    "解析状态": metadata.get("parse_status", "未知")})
+        if p.get("forward"):
+            contracts.append(_contract_time_row(p["project_code"], "前向", p["forward"]))
+        for index, contract in enumerate(p.get("backward_contracts", []), 1):
+            contracts.append(_contract_time_row(p["project_code"], f"后向{index}", contract))
         for difference in equipment_differences:
             item = difference.get("forward", {})
             quantity = item.get("quantity")
@@ -177,11 +236,8 @@ def export_review(store: ReviewStore, path: Path, project_codes: set[str] | None
                 "风险等级": difference.get("risk_level", "高风险"),
                 "风险说明": difference.get("description", "后向合同未找到该前向设备"),
             })
-        time_reviews.extend({"记录类型": "前后向工期/节点", "项目编码": p["project_code"], **d}
-                            for d in p.get("schedule_differences", []))
-        time_reviews.extend({"记录类型": "收入收款计划复核", "项目编码": p["project_code"], **d}
-                            for d in p.get("plan_differences", []))
-        scopes.extend({"项目编码": p["project_code"], **d} for d in p.get("scope_differences", []))
+        time_reviews.extend(_plan_review_row(p["project_code"], d) for d in p.get("plan_differences", []))
+        scopes.extend(_scope_review_row(p["project_code"], d) for d in p.get("scope_differences", []))
         review_rows.extend({"记录类型": "待人工复核", "项目编码": p["project_code"], **x}
                            for x in p.get("review_issues", []))
     review_rows.extend({"记录类型": "人工纠正", **x} for x in store.list_corrections()

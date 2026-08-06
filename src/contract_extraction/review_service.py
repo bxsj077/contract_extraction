@@ -9,24 +9,29 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from .comparisons import RESPONSIBILITY_SCORE, compare_equipment, compare_schedule, compare_scopes, overall_risk
+from .date_utils import calculate_end_date
 from .pdf_io import LocalOcr, extract_pdf_pages, sha256_file
 from .pipeline import load_config
 from .project_io import scan_projects
 from .revenue_plan import compare_income_collection_plan
 from .rules import analyze_contract
-from .storage import ReviewStore
+from .storage import ReviewStore, finding_key
 from .structured import analysis_to_structured, structured_from_dict, structured_to_dict
 from .system_models import ContractStructured, ProjectFiles, ProjectReviewResult, TimePlan
 
 
 LOGGER = logging.getLogger("contract_review")
-PARSE_VERSION = "2026.08-v11-procurement-delivery-milestones"
+PARSE_VERSION = "2026.08-v12-compact-procurement-multi-backward"
 CORRECTABLE_FIELDS = {
-    "contract_number", "contract_name", "party_a", "party_b", "sign_date", "effective_date", "contract_type",
+    "contract_number", "contract_name", "party_a", "party_b", "amount_yuan", "sign_date", "effective_date", "contract_type",
     "procurement_involved", "procurement_note", "time_plan.duration_value", "time_plan.duration_unit",
     "time_plan.duration_conclusion", "time_plan.duration_raw", "time_plan.calculation_status",
     "time_plan.start_condition_type", "time_plan.start_condition_text", "time_plan.start_date",
     "time_plan.finish_date", "time_plan.completion_node", "time_plan.fixed_deadline",
+    "key_clauses.服务内容", "key_clauses.乙方义务", "key_clauses.关键条款",
+    *(f"time_plan.milestones.{node}" for node in ("到货", "初验", "终验")),
+    *(f"time_plan.milestone_details.{node}.{field}" for node in ("到货", "初验", "终验")
+      for field in ("原文", "相对期限", "计算日期", "计算状态")),
 }
 
 
@@ -60,6 +65,156 @@ class ReviewService:
             LOGGER.addHandler(handler)
             LOGGER.setLevel(logging.INFO)
 
+    @staticmethod
+    def _iso_date(value: object) -> date | None:
+        if not value:
+            return None
+        try:
+            return date.fromisoformat(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _relative_deadline(value: object) -> tuple[int, str] | None:
+        match = re.search(
+            r"([0-9]{1,4}|[一二两三四五六七八九十]{1,3})\s*"
+            r"(个?工作日|日历日|日历天|天|日|个月|月|年)",
+            str(value or ""),
+        )
+        if not match:
+            return None
+        raw = match.group(1)
+        if raw.isdigit():
+            amount = int(raw)
+        else:
+            digits = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+                      "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+            if raw == "十":
+                amount = 10
+            elif "十" in raw:
+                left, right = raw.split("十", 1)
+                amount = digits.get(left, 1) * 10 + digits.get(right, 0)
+            elif raw in digits:
+                amount = digits[raw]
+            else:
+                return None
+        return amount, match.group(2)
+
+    def _recalculate_timeline(self, contract: ContractStructured, corrected_paths: set[str]) -> None:
+        """Cascade manual date/duration corrections through dependent contract nodes."""
+        plan = contract.time_plan
+        manual_start = "time_plan.start_date" in corrected_paths
+        manual_finish = "time_plan.finish_date" in corrected_paths
+        sign_date = self._iso_date(contract.sign_date)
+        effective_date = self._iso_date(contract.effective_date)
+        start_type = str(plan.start_condition_type or "")
+
+        if not manual_start and start_type != "固定日期区间":
+            if re.search(r"合同(?:签订|签署)|签约归档", start_type) and sign_date:
+                plan.start_date = sign_date.isoformat()
+            elif "合同生效" in start_type and effective_date:
+                plan.start_date = effective_date.isoformat()
+            elif re.search(r"甲方通知|开工令|进场通知|开工通知", start_type):
+                # These clauses require the actual notice date; a signing date is not a substitute.
+                plan.start_date = None
+            elif "sign_date" in corrected_paths and sign_date:
+                # The contract has no reliable start clause. Still provide a transparent planning estimate.
+                plan.start_date = sign_date.isoformat()
+
+        start_date = self._iso_date(plan.start_date)
+        if plan.duration_value is not None and "time_plan.duration_conclusion" not in corrected_paths:
+            plan.duration_conclusion = f"人工确认：{plan.duration_value}{plan.duration_unit}" if (
+                "time_plan.duration_value" in corrected_paths or "time_plan.duration_unit" in corrected_paths
+            ) else plan.duration_conclusion
+
+        if not manual_finish and start_date and plan.duration_value is not None:
+            finish, note = calculate_end_date(start_date, int(plan.duration_value), str(plan.duration_unit))
+            if finish:
+                plan.finish_date = finish.isoformat()
+                if "sign_date" in corrected_paths and not re.search(r"甲方通知|开工令|进场通知|开工通知", start_type):
+                    prefix = "已按人工补录签订日期联动计算"
+                else:
+                    prefix = "已按起算日期和工期联动计算"
+                plan.calculation_status = prefix + (f"；{note}" if note else "")
+            else:
+                plan.finish_date = None
+                plan.calculation_status = note or "工期单位不支持自动计算"
+        elif not manual_finish and plan.duration_value is not None and not start_date:
+            plan.finish_date = None
+            if re.search(r"甲方通知|开工令|进场通知|开工通知", start_type):
+                plan.calculation_status = "已识别工期，但需人工补录甲方通知或开工令日期后才能联动计算"
+            else:
+                plan.calculation_status = "已识别工期，但缺少可计算的起算日期"
+
+        calculated_nodes: dict[str, date] = {}
+        overall_finish = self._iso_date(plan.finish_date)
+        for node in ("到货", "初验", "终验"):
+            detail = plan.milestone_details.setdefault(
+                node, {"原文": "", "相对期限": "", "计算日期": "", "计算状态": "合同未约定该节点"})
+            manual_node = (f"time_plan.milestones.{node}" in corrected_paths
+                           or f"time_plan.milestone_details.{node}.计算日期" in corrected_paths)
+            if manual_node:
+                manual_value = self._iso_date(detail.get("计算日期") or plan.milestones.get(node))
+                if manual_value:
+                    calculated_nodes[node] = manual_value
+                continue
+            if detail.get("计算状态") == "合同约定了明确日期":
+                explicit = self._iso_date(detail.get("计算日期") or plan.milestones.get(node))
+                if explicit:
+                    invalid_before_start = bool(start_date and explicit < start_date)
+                    invalid_final_before_finish = bool(node == "终验" and overall_finish and explicit < overall_finish)
+                    if not invalid_before_start and not invalid_final_before_finish:
+                        calculated_nodes[node] = explicit
+                        continue
+                    detail["计算日期"] = ""
+                    plan.milestones.pop(node, None)
+                    detail["计算状态"] = (
+                        "原识别日期早于项目起算或整体完工日期，已判定为时间异常并重新联动计算"
+                    )
+
+            relative_text = str(detail.get("相对期限") or "")
+            relative = self._relative_deadline(relative_text)
+            calculated: date | None = None
+            basis_name = ""
+            if relative:
+                prefix = relative_text[:relative_text.find(str(relative[0]))] if str(relative[0]) in relative_text else relative_text
+                if re.search(r"合同(?:签订|签署)", prefix):
+                    calculated, basis_name = sign_date, "合同签订日期"
+                elif "合同生效" in prefix:
+                    calculated, basis_name = effective_date, "合同生效日期"
+                elif re.search(r"开工令|甲方通知|进场通知|开工通知|开工", prefix):
+                    calculated, basis_name = start_date, "开工日期"
+                elif re.search(r"到货|交货|供货(?:完成|结束)", prefix):
+                    calculated, basis_name = calculated_nodes.get("到货"), "到货日期"
+                elif re.search(r"初验|初步验收", prefix):
+                    calculated, basis_name = calculated_nodes.get("初验"), "初验日期"
+                else:
+                    calculated, basis_name = start_date, "项目起算日期"
+                if calculated:
+                    calculated, note = calculate_end_date(calculated, relative[0], relative[1])
+                    if calculated:
+                        detail["计算日期"] = calculated.isoformat()
+                        detail["计算状态"] = f"已按{basis_name}及相对期限联动计算" + (f"；{note}" if note else "")
+                        plan.milestones[node] = calculated.isoformat()
+                        calculated_nodes[node] = calculated
+                        continue
+                detail["计算日期"] = ""
+                plan.milestones.pop(node, None)
+                detail["计算状态"] = f"有明确相对期限，但缺少可确定的{basis_name or '基准日期'}"
+
+        # Overall duration normally represents completion/final acceptance. Use it as a derived
+        # terminal-acceptance date only when the contract has no independent explicit/manual date.
+        final_path = "time_plan.milestone_details.终验.计算日期"
+        final_manual = final_path in corrected_paths or "time_plan.milestones.终验" in corrected_paths
+        final_detail = plan.milestone_details.setdefault(
+            "终验", {"原文": "", "相对期限": "", "计算日期": "", "计算状态": "合同未约定该节点"})
+        final_explicit = final_detail.get("计算状态") == "合同约定了明确日期"
+        finish_date = self._iso_date(plan.finish_date)
+        if finish_date and not final_manual and not final_explicit and not final_detail.get("相对期限"):
+            plan.milestones["终验"] = finish_date.isoformat()
+            final_detail["计算日期"] = finish_date.isoformat()
+            final_detail["计算状态"] = "按项目整体工期完成日推算终验日期"
+
     def _apply_corrections(self, contract: ContractStructured | None, contract_key: str) -> ContractStructured | None:
         if contract is None:
             return None
@@ -72,39 +227,42 @@ class ReviewService:
             value = correction["corrected_value"]
             if field_path == "time_plan.duration_value" and value not in (None, ""):
                 value = int(value)
+            elif field_path == "amount_yuan" and value not in (None, ""):
+                value = float(value)
             elif field_path == "procurement_involved" and isinstance(value, str):
                 value = value.strip().lower() in {"true", "1", "是", "涉及"}
             target: object = contract
             parts = field_path.split(".")
             for part in parts[:-1]:
-                target = getattr(target, part)
-            setattr(target, parts[-1], value)
+                if isinstance(target, dict):
+                    target = target.setdefault(part, {})
+                else:
+                    target = getattr(target, part)
+            if isinstance(target, dict):
+                target[parts[-1]] = value
+            else:
+                setattr(target, parts[-1], value)
             corrected_paths.add(field_path)
             applied.append({"id": correction["id"], "contract_key": contract_key, "field_path": field_path,
                             "corrected_value": value, "note": correction.get("note", ""),
                             "updated_at": correction.get("updated_at", "")})
         if not applied:
             return contract
-        plan = contract.time_plan
-        if "time_plan.duration_value" in corrected_paths or "time_plan.duration_unit" in corrected_paths:
-            if plan.duration_value is not None:
-                if "time_plan.duration_conclusion" not in corrected_paths:
-                    plan.duration_conclusion = f"人工确认：{plan.duration_value}{plan.duration_unit}"
-                if plan.start_date and plan.duration_unit in {"日", "天", "工作日", "日历天", "个工作日"}:
-                    try:
-                        plan.finish_date = (date.fromisoformat(plan.start_date) + timedelta(days=plan.duration_value)).isoformat()
-                        plan.calculation_status = "已按人工确认的工期计算完成日期"
-                    except ValueError:
-                        plan.finish_date = None
-                        plan.calculation_status = "人工确认的起算日期格式无效，应使用YYYY-MM-DD"
-                else:
-                    plan.finish_date = None
-                    plan.calculation_status = "工期已人工确认，但缺少可计算的起算日期或单位"
-            else:
-                plan.finish_date = None
+        self._recalculate_timeline(contract, corrected_paths)
         contract.parse_metadata["applied_corrections"] = applied
         contract.parse_metadata["correction_count"] = len(applied)
         return contract
+
+    def _apply_finding_overrides(self, project_code: str, category: str, findings: list) -> list:
+        overrides = self.store.finding_overrides(project_code, category)
+        for finding in findings:
+            override = overrides.get(finding_key(category, finding))
+            if not override:
+                continue
+            finding.status = override["status"]
+            finding.risk_level = override["risk_level"]
+            finding.description = override["description"]
+        return findings
 
     def _parse_bundle(self, project: ProjectFiles, direction: str, paths: list[str], cache_key: str,
                       output_name: str, force: bool) -> ContractStructured | None:
@@ -247,12 +405,17 @@ class ReviewService:
             backward = self._aggregate_backward(project.project_code, backward_contracts)
             equipment = []; schedule = []; scopes = []
             plan_differences = compare_income_collection_plan(
-                forward, project.revenue_plan_files, int(self.config.get("plan_date_tolerance_days", 31)))
+                forward, project.revenue_plan_files, int(self.config.get("plan_date_tolerance_days", 31)),
+                backward_contracts=backward_contracts)
             if forward and backward:
                 equipment = compare_equipment(forward, backward)
+                dismissed_equipment = self.store.dismissed_finding_keys(project.project_code, "equipment")
+                equipment = [item for item in equipment if finding_key("equipment", item) not in dismissed_equipment]
                 if "运维类" not in {forward.contract_type, backward.contract_type}:
                     schedule = compare_schedule(forward, backward, int(self.config.get("safety_buffer_days", 15)))
                     scopes = compare_scopes(forward, backward)
+                    schedule = self._apply_finding_overrides(project.project_code, "schedule", schedule)
+                    scopes = self._apply_finding_overrides(project.project_code, "scope", scopes)
                 else:
                     project.issues.append("存在运维类合同，仅执行设备/服务对象清单覆盖和收入收款计划复核，不执行建设工期及实施责任对比")
                 parsed_contracts = ([forward] if forward else []) + backward_contracts

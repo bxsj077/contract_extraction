@@ -9,12 +9,13 @@ from openpyxl import load_workbook
 from contract_extraction.comparisons import compare_equipment, compare_schedule, compare_scopes
 from contract_extraction.api import create_app
 from contract_extraction.review_export import _header_cn, export_project_reviews, export_review
+from contract_extraction.review_service import ReviewService
 from contract_extraction.project_io import scan_projects
-from contract_extraction.revenue_plan import compare_income_collection_plan, extract_plan_periods
+from contract_extraction.revenue_plan import compare_income_collection_plan, extract_plan_nodes, extract_plan_periods
 from contract_extraction.structured import _extract_equipment, _extract_time_plan
 from contract_extraction.models import PageText
-from contract_extraction.storage import ReviewStore
-from contract_extraction.system_models import ContractStructured, EquipmentItem, ScopeItem, TimePlan
+from contract_extraction.storage import ReviewStore, finding_key
+from contract_extraction.system_models import ContractStructured, Difference, EquipmentItem, ScopeItem, TimePlan
 
 
 class ReviewSystemTests(unittest.TestCase):
@@ -44,6 +45,57 @@ class ReviewSystemTests(unittest.TestCase):
             self.assertTrue(any(getattr(route, "path", "") == "/api/tasks" for route in app.routes))
             self.assertTrue(any(getattr(route, "path", "") == "/api/projects/{project_code}" and
                                 "DELETE" in getattr(route, "methods", set()) for route in app.routes))
+            self.assertTrue(any(getattr(route, "path", "") ==
+                                "/api/projects/{project_code}/findings/equipment/{finding_index}" and
+                                "DELETE" in getattr(route, "methods", set()) for route in app.routes))
+            self.assertTrue(any(getattr(route, "path", "") ==
+                                "/api/projects/{project_code}/findings/{category}/{finding_index}" and
+                                "PUT" in getattr(route, "methods", set()) for route in app.routes))
+            fields_route = next(route.endpoint for route in app.routes
+                                if getattr(route, "path", "") == "/api/correction-fields")
+            fields = fields_route()
+            self.assertIn({"field_path": "amount_yuan", "label": "合同金额（元）", "group": "合同基本信息"}, fields)
+            self.assertTrue(any(item["field_path"] == "time_plan.milestone_details.到货.计算日期"
+                                and item["group"] == "时间节点" for item in fields))
+
+    def test_dismissed_equipment_finding_is_persisted_until_project_delete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReviewStore(Path(tmp) / "review.db")
+            finding = {
+                "rule_id": "EQ-001", "title": "人脸识别终端设备",
+                "forward": {"standard_name": "人脸识别终端设备", "brand": "海康威视",
+                            "model": "DS-K1T673MW"},
+            }
+            expected = finding_key("equipment", finding)
+            saved = store.dismiss_finding("P001", "equipment", finding, "人工确认后删除")
+            self.assertEqual(saved["finding_key"], expected)
+            self.assertEqual(store.dismissed_finding_keys("P001", "equipment"), {expected})
+            store.delete_project("P001")
+            self.assertEqual(store.dismissed_finding_keys("P001", "equipment"), set())
+
+    def test_schedule_and_scope_finding_overrides_are_persisted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReviewStore(Path(tmp) / "review.db")
+            finding = {"rule_id": "SC-001", "title": "设备安装", "status": "实施内容缺失",
+                       "risk_level": "高风险", "description": "自动判断", "forward": {}, "backward": {}}
+            saved = store.save_finding_override(
+                "P001", "scope", finding, "人工确认已覆盖", "无风险", "已在后向附件中确认", "人工复核")
+            overrides = store.finding_overrides("P001", "scope")
+            self.assertIn(saved["finding_key"], overrides)
+            self.assertEqual(overrides[saved["finding_key"]]["risk_level"], "无风险")
+            store.delete_project("P001")
+            self.assertEqual(store.finding_overrides("P001", "scope"), {})
+
+    def test_saved_finding_override_is_applied_to_recalculated_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ReviewService(root / "contracts", root / "output")
+            finding = Difference("实施内容", "实施内容缺失", "高风险", "SC-001", "设备安装", "自动判断")
+            service.store.save_finding_override(
+                "P001", "scope", finding, "人工确认已覆盖", "无风险", "已在后向附件中确认")
+            applied = service._apply_finding_overrides("P001", "scope", [finding])[0]
+            self.assertEqual((applied.status, applied.risk_level, applied.description),
+                             ("人工确认已覆盖", "无风险", "已在后向附件中确认"))
 
     def test_home_supports_project_detail_and_section_hash_routes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -54,8 +106,13 @@ class ReviewSystemTests(unittest.TestCase):
             self.assertIn('id="detail-equipment"', html)
             self.assertIn('id="detailEditPanel"', html)
             self.assertIn('id="detailEditForm"', html)
+            self.assertIn('id="findingEditForm"', html)
+            self.assertIn('id="scopeRiskFilter"', html)
             self.assertIn("function openProject", html)
             self.assertIn("function openDetailEditor", html)
+            self.assertIn("function openFindingEditor", html)
+            self.assertIn("function renderScopeDifferences", html)
+            self.assertIn("function deleteEquipmentFinding", html)
             self.assertIn("#project/${code}/equipment", html)
             self.assertIn("deleteProject(currentProjectCode)", html)
 
@@ -283,6 +340,32 @@ class ReviewSystemTests(unittest.TestCase):
         self.assertEqual(items[5].model, "RG-IF2920-24GT4MS-P")
         self.assertEqual((items[6].standard_name, items[6].category), ("集成服务", "软件/服务"))
 
+    def test_compact_procurement_tables_with_and_without_brand_model_are_extracted(self):
+        pages = [
+            PageText("宏锦翔.pdf", "宏锦翔.pdf", 8, "\n".join([
+                "清单：", "序号 采购内容 数量 单位 品牌 型号",
+                "1 一体化云台监控设备 17 套 恩博 QRS7108-FMSZ3939",
+                "2 智能识别报警设备 17 个 恩博 NB320-QRS111",
+                "3 指挥中心大屏 1 套 创维", "SKYWORTH M55PJRGL-DS",
+                "4 报警核实服务 26 路/3 年 / /", "]", "甲方：中电鸿信",
+            ]), "原生文本层", confidence=1.0),
+            PageText("铁塔.pdf", "铁塔.pdf", 8, "\n".join([
+                "清单：", "序号 采购内容 数量 单位",
+                "1 网络技术服务 1 18 条/3 年",
+                "2 设备安装集成服务 2 17 项",
+                "3 设备运营服务 17 项/3 年", "]", "甲方：中电鸿信",
+            ]), "原生文本层", confidence=1.0),
+        ]
+        items = _extract_equipment("P1", "后向", pages, [])
+        self.assertEqual(len(items), 7)
+        self.assertEqual((items[0].standard_name, items[0].brand, items[0].model,
+                          items[0].quantity, items[0].unit),
+                         ("一体化云台监控设备", "恩博", "QRS7108-FMSZ3939", 17, "套"))
+        self.assertEqual((items[2].standard_name, items[2].model),
+                         ("指挥中心大屏", "SKYWORTH M55PJRGL-DS"))
+        self.assertEqual((items[-2].standard_name, items[-2].quantity),
+                         ("设备安装集成服务 2", 17))
+
     def test_hardware_supply_clause_is_selected_as_delivery_milestone(self):
         page = PageText("前向.pdf", "前向.pdf", 25,
                         "第一次付款：子合同签订后 40 日历日内完成硬\n件供货。"
@@ -308,8 +391,26 @@ class ReviewSystemTests(unittest.TestCase):
             contract = self.contract("前向")
             contract.time_plan = TimePlan(12, "个月", "固定日期区间", start_date="2026-04-16", finish_date="2027-04-15")
             result = compare_income_collection_plan(contract, [str(path)])[0]
-            self.assertEqual(result.status, "基本一致，需复核偏差")
-            self.assertIn("-15天", result.description)
+            self.assertEqual(result.status, "基本一致")
+            self.assertIn("+15天", result.description)
+
+    def test_income_and_collection_plan_milestones_are_extracted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "计划.xls"
+            path.write_text('''<?xml version="1.0"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
+<Worksheet ss:Name="收入计划"><Table>
+<Row><Cell><Data ss:Type="String">里程碑节点</Data></Cell><Cell><Data ss:Type="String">预计确认日期</Data></Cell></Row>
+<Row><Cell><Data ss:Type="String">设备到货</Data></Cell><Cell><Data ss:Type="String">2026-07-28</Data></Cell></Row>
+</Table></Worksheet>
+<Worksheet ss:Name="收款计划"><Table>
+<Row><Cell><Data ss:Type="String">履行要求</Data></Cell><Cell><Data ss:Type="String">收款计划</Data></Cell></Row>
+<Row><Cell ss:Index="2"><Data ss:Type="String">预计收款日期</Data></Cell></Row>
+<Row><Cell><Data ss:Type="String">终验款</Data></Cell><Cell><Data ss:Type="String">2026-10-20</Data></Cell></Row>
+</Table></Worksheet></Workbook>''', encoding="utf-8")
+            nodes = extract_plan_nodes(path)
+            self.assertEqual([(x["plan_type"], x["node"], x["plan_date"]) for x in nodes],
+                             [("收入计划", "到货", "2026-07-28"), ("收款计划", "终验", "2026-10-20")])
 
     def test_export_headers_are_chinese(self):
         self.assertEqual(_header_cn("risk_level"), "风险等级")
@@ -346,19 +447,25 @@ class ReviewSystemTests(unittest.TestCase):
 
             full_wb = load_workbook(full_path, read_only=True, data_only=True)
             rows = list(full_wb["合同解析结果"].values)
-            self.assertIn("工期", rows[0])
+            sheet_names = full_wb.sheetnames
+            equipment_rows = list(full_wb["设备未覆盖风险"].values)
+            full_wb.close()
+            self.assertIn("项目整体工期", rows[0])
             self.assertNotIn("工期数值", rows[0])
             self.assertNotIn("工期单位", rows[0])
-            duration_col = rows[0].index("工期")
-            self.assertEqual([row[duration_col] for row in rows[1:]], ["12个月", "按招标文件及投标文件执行"])
-            self.assertIn("设备未覆盖风险", full_wb.sheetnames)
-            equipment_rows = list(full_wb["设备未覆盖风险"].values)
+            self.assertNotIn("工期关键判断", rows[0])
+            self.assertNotIn("甲方", rows[0])
+            self.assertNotIn("服务内容", rows[0])
+            self.assertEqual(len(rows[0]), 14)
+            duration_col = rows[0].index("项目整体工期")
+            self.assertEqual([row[duration_col] for row in rows[1:]],
+                             ["明确：12个月", "未明确：按招标文件及投标文件执行"])
+            self.assertIn("设备未覆盖风险", sheet_names)
             self.assertEqual(equipment_rows[0], (
                 "项目编码", "前向设备名称", "前向品牌", "前向型号", "前向数量",
                 "后向查找结果", "风险等级", "风险说明"))
             self.assertEqual(equipment_rows[1][1:7],
                              ("数据库审计设备", "示例品牌", "DBA-1000", "2台", "未找到", "高风险"))
-            full_wb.close()
             self.assertEqual(len(project_paths), 2)
             for path in project_paths:
                 wb = load_workbook(path, read_only=True, data_only=True)
@@ -366,10 +473,34 @@ class ReviewSystemTests(unittest.TestCase):
                 self.assertEqual(wb["合同解析结果"].max_row, 2)
                 wb.close()
 
-    def test_equipment_found_is_not_listed_even_if_quantity_is_lower(self):
+    def test_equipment_with_matching_model_but_lower_quantity_is_listed(self):
         f, b = self.contract("前向"), self.contract("后向")
         f.equipment = [EquipmentItem(standard_name="核心交换机", model="S6730", unit="台", quantity=2, evidence_id="F")]
         b.equipment = [EquipmentItem(standard_name="核心交换机", model="S6730", unit="台", quantity=1, evidence_id="B")]
+        result = compare_equipment(f, b)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].status, "后向数量不足")
+
+    def test_equipment_model_and_quantity_match_tolerates_ocr_suffix(self):
+        f, b = self.contract("前向"), self.contract("后向")
+        f.equipment = [EquipmentItem(standard_name="一体化云台摄像机恩博", model="QRS7108-FMSZ3939180",
+                                     unit="套", quantity=17, evidence_id="F")]
+        b.equipment = [EquipmentItem(standard_name="一体化云台监控设备", model="QRS7108-FMSZ3939",
+                                     unit="套", quantity=17, evidence_id="B")]
+        self.assertEqual(compare_equipment(f, b), [])
+
+    def test_equipment_semantic_alias_and_quantity_match(self):
+        f, b = self.contract("前向"), self.contract("后向汇总")
+        f.equipment = [
+            EquipmentItem(standard_name="设备挂载费国产优质项目配套 180", unit="项", quantity=16, evidence_id="F1"),
+            EquipmentItem(standard_name="中间件东方通东方通 180", unit="套", quantity=2, evidence_id="F2"),
+            EquipmentItem(standard_name="平山林场维护服务国产优质项目配套 180", unit="项", quantity=3, evidence_id="F3"),
+        ]
+        b.equipment = [
+            EquipmentItem(standard_name="设备安装集成服务 1", unit="项", quantity=16, evidence_id="B1"),
+            EquipmentItem(standard_name="中间模块服务", unit="套", quantity=2, evidence_id="B2"),
+            EquipmentItem(standard_name="监控设备维护服务", unit="项", quantity=3, evidence_id="B3"),
+        ]
         self.assertEqual(compare_equipment(f, b), [])
 
     def test_only_forward_equipment_not_found_backward_is_listed(self):
@@ -404,6 +535,18 @@ class ReviewSystemTests(unittest.TestCase):
         f.scopes = [ScopeItem("数据迁移", "负责完成", "全部历史数据", "全部", "", "前向", "", "F", .9)]
         b.scopes = [ScopeItem("数据迁移", "配合", "基础数据", "部分", "", "后向", "", "B", .9)]
         self.assertEqual(compare_scopes(f, b)[0].status, "责任程度弱化")
+
+    def test_scope_comparison_excludes_supply_and_groups_installation_commissioning(self):
+        f, b = self.contract("前向"), self.contract("后向")
+        f.scopes = [
+            ScopeItem("供货", "提供", "设备", "全部", "", "前向", "负责供货", "F1", .9),
+            ScopeItem("安装", "负责完成", "设备", "全部", "", "前向", "负责安装", "F2", .9),
+            ScopeItem("通电", "负责完成", "设备", "全部", "", "前向", "负责通电", "F3", .9),
+        ]
+        b.scopes = [ScopeItem("系统联调", "负责完成", "系统", "全部", "", "后向", "系统联调", "B1", .9)]
+        result = compare_scopes(f, b)
+        self.assertEqual([item.title for item in result], ["实施调试"])
+        self.assertEqual(result[0].status, "完全覆盖")
 
 
 if __name__ == "__main__":

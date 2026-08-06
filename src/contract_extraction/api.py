@@ -27,6 +27,13 @@ class CorrectionRequest(BaseModel):
     note: str = ""
 
 
+class FindingOverrideRequest(BaseModel):
+    status: str
+    risk_level: str
+    description: str
+    note: str = ""
+
+
 def _normalize_duration_correction(value: object | None) -> tuple[int | None, str]:
     """Split a manual duration entry into a numeric value or a textual conclusion."""
     if value is None or (isinstance(value, str) and not value.strip()):
@@ -99,6 +106,7 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
     def correction_fields():
         labels = {
             "contract_number": "合同编号", "contract_name": "合同名称", "party_a": "甲方", "party_b": "乙方",
+            "amount_yuan": "合同金额（元）",
             "sign_date": "合同签订日期", "effective_date": "合同生效日期", "contract_type": "合同性质",
             "procurement_involved": "是否涉及货物采购", "procurement_note": "货物采购说明",
             "time_plan.duration_value": "工期数值", "time_plan.duration_unit": "工期单位",
@@ -107,8 +115,33 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
             "time_plan.start_condition_text": "起算条件原文", "time_plan.start_date": "实际起算日期",
             "time_plan.finish_date": "预计完成日期", "time_plan.completion_node": "完成节点",
             "time_plan.fixed_deadline": "固定截止日期",
+            "key_clauses.服务内容": "服务内容条款", "key_clauses.乙方义务": "乙方义务条款",
+            "key_clauses.关键条款": "其他关键条款",
         }
-        return [{"field_path": field, "label": labels.get(field, field)} for field in sorted(CORRECTABLE_FIELDS)]
+        groups = [
+            ("合同基本信息", ["contract_name", "contract_number", "contract_type", "amount_yuan", "party_a", "party_b",
+                            "sign_date", "effective_date"]),
+            ("采购情况", ["procurement_involved", "procurement_note"]),
+            ("工期", ["time_plan.duration_value", "time_plan.duration_unit", "time_plan.duration_conclusion",
+                    "time_plan.duration_raw", "time_plan.start_condition_type", "time_plan.start_condition_text",
+                    "time_plan.start_date", "time_plan.finish_date", "time_plan.fixed_deadline",
+                    "time_plan.completion_node", "time_plan.calculation_status"]),
+            ("时间节点", [path for node in ("到货", "初验", "终验")
+                       for path in (f"time_plan.milestones.{node}",
+                                    f"time_plan.milestone_details.{node}.原文",
+                                    f"time_plan.milestone_details.{node}.相对期限",
+                                    f"time_plan.milestone_details.{node}.计算日期",
+                                    f"time_plan.milestone_details.{node}.计算状态")]),
+            ("关键条款", ["key_clauses.服务内容", "key_clauses.乙方义务", "key_clauses.关键条款"]),
+        ]
+        for node in ("到货", "初验", "终验"):
+            labels[f"time_plan.milestones.{node}"] = f"{node}节点（汇总值）"
+            labels[f"time_plan.milestone_details.{node}.原文"] = f"{node}节点原文"
+            labels[f"time_plan.milestone_details.{node}.相对期限"] = f"{node}相对期限"
+            labels[f"time_plan.milestone_details.{node}.计算日期"] = f"{node}计算日期"
+            labels[f"time_plan.milestone_details.{node}.计算状态"] = f"{node}计算状态"
+        return [{"field_path": field, "label": labels.get(field, field), "group": group}
+                for group, fields in groups for field in fields if field in CORRECTABLE_FIELDS]
 
     @app.get("/api/tasks")
     def task_list():
@@ -229,6 +262,47 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
         if not payload:
             raise HTTPException(404, "项目不存在或尚未处理")
         return payload
+
+    @app.delete("/api/projects/{project_code}/findings/equipment/{finding_index}")
+    def dismiss_equipment_finding(project_code: str, finding_index: int, note: str = Query("人工删除未覆盖设备风险项")):
+        payload = service.store.get_project(project_code)
+        if not payload:
+            raise HTTPException(404, "项目不存在或尚未处理")
+        findings = payload.get("equipment_differences") or []
+        if finding_index < 0 or finding_index >= len(findings):
+            raise HTTPException(404, "该未覆盖设备风险项不存在或已被删除")
+        found = scan_projects(service.contract_root, {project_code})
+        if not found:
+            raise HTTPException(409, "项目合同目录不存在，无法保存删除结果并重新计算")
+        dismissed = service.store.dismiss_finding(project_code, "equipment", findings[finding_index], note.strip())
+        result = service.process_project(found[0], force=False)
+        return {"status": "该未覆盖设备风险项已删除并重新计算", "dismissed": dismissed,
+                "project_status": result.status, "risk_level": result.risk_level,
+                "remaining_count": len(result.equipment_differences)}
+
+    @app.put("/api/projects/{project_code}/findings/{category}/{finding_index}")
+    def override_review_finding(project_code: str, category: str, finding_index: int,
+                                request: FindingOverrideRequest):
+        field_map = {"schedule": "schedule_differences", "scope": "scope_differences"}
+        if category not in field_map:
+            raise HTTPException(400, "仅支持编辑工期与时间节点、实施内容差异")
+        if request.risk_level not in {"高风险", "中风险", "待确认", "无风险"}:
+            raise HTTPException(400, "风险等级无效")
+        payload = service.store.get_project(project_code)
+        if not payload:
+            raise HTTPException(404, "项目不存在或尚未处理")
+        findings = payload.get(field_map[category]) or []
+        if finding_index < 0 or finding_index >= len(findings):
+            raise HTTPException(404, "该审查结果不存在或已经变化")
+        found = scan_projects(service.contract_root, {project_code})
+        if not found:
+            raise HTTPException(409, "项目合同目录不存在，无法保存修改并重新计算")
+        override = service.store.save_finding_override(
+            project_code, category, findings[finding_index], request.status.strip(),
+            request.risk_level, request.description.strip(), request.note.strip())
+        result = service.process_project(found[0], force=False)
+        return {"status": "审查结果已人工修改并重新计算", "override": override,
+                "project_status": result.status, "risk_level": result.risk_level}
 
     @app.delete("/api/projects/{project_code}")
     def delete_project(project_code: str):
