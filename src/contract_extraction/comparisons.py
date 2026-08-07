@@ -30,6 +30,7 @@ def _model_score(forward, backward) -> float:
 
 def _name_key(value: str) -> str:
     normalized = _norm(value)
+    normalized = normalized.replace("接闪器", "避雷针")
     normalized = normalized.replace("国产优质项目配套", "").replace("项目配套", "")
     normalized = normalized.replace("服务费", "").replace("服务", "").replace("费用", "")
     return re.sub(r"180$", "", normalized)
@@ -37,6 +38,8 @@ def _name_key(value: str) -> str:
 
 def _semantic_equipment_class(value: str) -> str:
     normalized = _name_key(value)
+    if "避雷针" in normalized:
+        return "避雷针"
     if "挂载" in normalized or "安装集成" in normalized:
         return "安装集成"
     if "中间件" in normalized or "中间模块" in normalized:
@@ -60,8 +63,16 @@ def _name_score(forward, backward) -> float:
     if len(shorter) >= 4 and shorter in longer:
         return .9
     backward_model = _norm(backward.model)
-    if backward_model and backward_model != "/" and len(backward_model) >= 4 and backward_model in _norm(forward.standard_name):
-        return .9
+    forward_name = _norm(forward.standard_name)
+    if backward_model and backward_model != "/":
+        if ((len(backward_model) >= 4 or re.fullmatch(r"\d+(?:\.\d+)?[kmg](?:bps)?", backward_model))
+                and backward_model in forward_name):
+            return .9
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9._/\-]{3,}", forward.standard_name):
+            token = _norm(token)
+            shorter, longer = sorted((token, backward_model), key=len)
+            if len(shorter) >= 5 and longer.startswith(shorter):
+                return .9
     return SequenceMatcher(None, left, right).ratio()
 
 

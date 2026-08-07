@@ -4,14 +4,30 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from contract_extraction.api import _normalize_duration_correction
+from contract_extraction.api import _classify_folder_upload_path, _normalize_duration_correction
 from contract_extraction.models import PageText
 from contract_extraction.review_service import ReviewService
 from contract_extraction.structured import _extract_time_plan
-from contract_extraction.system_models import ContractStructured
+from contract_extraction.system_models import ContractStructured, EvidenceRef
 
 
 class CorrectionTests(unittest.TestCase):
+    def test_project_folder_upload_paths_are_classified(self):
+        self.assertEqual(
+            _classify_folder_upload_path("P001/前向/前向合同.pdf"),
+            ("P001", "前向", "前向合同.pdf"),
+        )
+        self.assertEqual(
+            _classify_folder_upload_path("P001/后向/供应商A/后向合同.pdf"),
+            ("P001", "后向", "后向合同.pdf"),
+        )
+        self.assertEqual(
+            _classify_folder_upload_path("P001/收入收款计划/计划.xlsx"),
+            ("P001", "收入收款计划", "计划.xlsx"),
+        )
+        self.assertIsNone(_classify_folder_upload_path("P001/说明/README.txt"))
+        self.assertIsNone(_classify_folder_upload_path("P001/../前向/合同.pdf"))
+
     def test_manual_duration_text_becomes_conclusion_not_number(self):
         value, conclusion = _normalize_duration_correction("供货要求等合同文件另有约定")
         self.assertIsNone(value)
@@ -86,6 +102,66 @@ class CorrectionTests(unittest.TestCase):
                 corrected.time_plan.milestone_details["终验"]["计算状态"],
                 "按项目整体工期完成日推算终验日期",
             )
+
+    def test_extracted_sign_date_and_duration_also_cascade_final_acceptance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ReviewService(root / "contracts", root / "output")
+            contract = ContractStructured("P1", "后向")
+            contract.sign_date = "2026-04-14"
+            contract.time_plan.duration_value = 150
+            contract.time_plan.duration_unit = "天"
+            contract.time_plan.start_condition_type = "签约归档开始"
+            contract.time_plan.start_date = "2026-04-14"
+            contract.time_plan.milestone_details["终验"] = {
+                "原文": "项目终验合格后30个工作日内付款",
+                "相对期限": "后30个工作日内",
+                "计算日期": "",
+                "计算状态": "有明确相对期限，但缺少可确定的基准日期",
+            }
+
+            corrected = service._apply_corrections(contract, "后向:001")
+
+            self.assertEqual(corrected.time_plan.finish_date, "2026-09-11")
+            self.assertEqual(corrected.time_plan.milestones["终验"], "2026-09-11")
+            self.assertEqual(
+                corrected.time_plan.milestone_details["终验"]["计算状态"],
+                "按项目整体工期完成日推算终验日期",
+            )
+
+    def test_duration_raw_prefers_traceable_duration_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ReviewService(root / "contracts", root / "output")
+            contract = ContractStructured("P1", "后向")
+            contract.time_plan.duration_value = 60
+            contract.time_plan.duration_unit = "天"
+            contract.time_plan.duration_raw = "误识别的合同标题"
+            contract.evidence.append(EvidenceRef(
+                "EV-1", "P1", "后向", "工期原文", "工期：本合同生效后[60天",
+                "后向合同.pdf", 1, "1.5工期：本合同生效后[60天。", "原生文本层", 0.98,
+            ))
+
+            corrected = service._apply_corrections(contract, "后向:001")
+
+            self.assertEqual(corrected.time_plan.duration_raw, "工期：本合同生效后[60天")
+
+    def test_duration_raw_does_not_accept_conflicting_ocr_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ReviewService(root / "contracts", root / "output")
+            contract = ContractStructured("P1", "后向")
+            contract.time_plan.duration_value = 150
+            contract.time_plan.duration_unit = "天"
+            contract.time_plan.duration_raw = "1.5 工期：本合同生效后[150]天。"
+            contract.evidence.append(EvidenceRef(
+                "EV-1", "P1", "后向", "工期原文", "工期：本合同生效后[50天",
+                "后向合同.pdf", 1, "1.5工期：本合同生效后[50天。", "OCR", 0.8,
+            ))
+
+            corrected = service._apply_corrections(contract, "后向:001")
+
+            self.assertEqual(corrected.time_plan.duration_raw, "1.5 工期：本合同生效后[150]天。")
 
     def test_invalid_ocr_final_date_before_start_is_replaced_by_duration_finish(self):
         with tempfile.TemporaryDirectory() as tmp:

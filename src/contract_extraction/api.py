@@ -47,6 +47,29 @@ def _normalize_duration_correction(value: object | None) -> tuple[int | None, st
     return None, conclusion
 
 
+def _classify_folder_upload_path(relative_path: str) -> tuple[str, str, str] | None:
+    """Return project folder, canonical category and base filename for a browser directory upload."""
+    parts = [part for part in relative_path.replace("\\", "/").split("/") if part not in {"", "."}]
+    if len(parts) < 3 or any(part == ".." for part in parts):
+        return None
+    project_code, filename = parts[0].strip(), Path(parts[-1]).name
+    if not project_code or not filename:
+        return None
+    category = ""
+    for part in parts[1:-1]:
+        compact = re.sub(r"\s+", "", part)
+        if "前向" in compact:
+            category = "前向"
+            break
+        if "后向" in compact:
+            category = "后向"
+            break
+        if ("收入" in compact or "收款" in compact) and "计划" in compact:
+            category = "收入收款计划"
+            break
+    return (project_code, category, filename) if category else None
+
+
 def create_app(contract_root: Path | None = None, output_root: Path | None = None) -> FastAPI:
     project_root = Path(__file__).resolve().parents[2]
     root = contract_root or Path(os.getenv("CONTRACT_ROOT", str(project_root / "data" / "contracts")))
@@ -242,6 +265,98 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
             task_id = uuid.uuid4().hex
             update_task(task_id, project_code=code, status="排队中",
                         stage="合同文件已保存，等待开始", progress=10,
+                        created_at=datetime.now().isoformat(timespec="seconds"))
+            background_tasks.add_task(run_review_task, task_id, code, overwrite)
+            payload.update({"处理状态": "后台处理中", "task_id": task_id,
+                            "任务查询地址": f"/api/tasks/{task_id}"})
+        return payload
+
+    @app.post("/api/projects/upload-folder")
+    async def upload_project_folder(background_tasks: BackgroundTasks,
+                                    project_files: list[UploadFile] = File(...),
+                                    relative_paths: list[str] = Form(...),
+                                    overwrite: bool = Query(False), process_now: bool = Query(True)):
+        if not project_files or len(project_files) != len(relative_paths):
+            raise HTTPException(400, "项目文件与相对路径数量不一致，请重新选择整个项目文件夹")
+        entries: list[tuple[UploadFile, str, str]] = []
+        ignored: list[str] = []
+        project_codes: set[str] = set()
+        for upload, relative_path in zip(project_files, relative_paths):
+            classified = _classify_folder_upload_path(relative_path)
+            if not classified:
+                ignored.append(relative_path)
+                continue
+            code, category, filename = classified
+            project_codes.add(code)
+            entries.append((upload, category, filename))
+        if len(project_codes) != 1:
+            raise HTTPException(400, "请选择一个完整项目文件夹，不能同时上传多个项目或缺少前向/后向目录")
+        code = next(iter(project_codes)).strip()
+        if not code or len(code) > 100 or re.search(r"[\\/:*?\"<>|]", code) or code in {".", ".."}:
+            raise HTTPException(400, "项目文件夹名称不能作为有效项目编码")
+        forward_entries = [entry for entry in entries if entry[1] == "前向" and Path(entry[2]).suffix.lower() == ".pdf"]
+        backward_entries = [entry for entry in entries if entry[1] == "后向" and Path(entry[2]).suffix.lower() == ".pdf"]
+        plan_entries = [entry for entry in entries if entry[1] == "收入收款计划"
+                        and Path(entry[2]).suffix.lower() in {".xls", ".xlsx", ".xml"}]
+        if not forward_entries:
+            raise HTTPException(400, "项目文件夹的“前向”目录中没有找到PDF合同")
+        if not backward_entries:
+            raise HTTPException(400, "项目文件夹的“后向”目录中没有找到PDF合同")
+        accepted_ids = {id(entry[0]) for entry in forward_entries + backward_entries + plan_entries}
+        ignored.extend(path for upload, path in zip(project_files, relative_paths) if id(upload) not in accepted_ids
+                       and path not in ignored)
+        single_project_mode = (service.contract_root / "前向").is_dir() or (service.contract_root / "后向").is_dir()
+        if single_project_mode and code != service.contract_root.name:
+            raise HTTPException(400, f"当前服务绑定单项目目录，只能上传项目 {service.contract_root.name}")
+        folder = service.contract_root if single_project_mode else service.contract_root / code
+        if folder.exists() and not overwrite and any(folder.iterdir()):
+            raise HTTPException(409, "项目已存在；如需替换，请勾选覆盖同项目已有文件")
+        forward_dir, backward_dir, plan_dir = folder / "前向", folder / "后向", folder / "收入收款计划"
+        if overwrite:
+            shutil.rmtree(forward_dir, ignore_errors=True)
+            shutil.rmtree(backward_dir, ignore_errors=True)
+            shutil.rmtree(plan_dir, ignore_errors=True)
+        forward_dir.mkdir(parents=True, exist_ok=True)
+        backward_dir.mkdir(parents=True, exist_ok=True)
+
+        def unique_target(directory: Path, raw_name: str, index: int) -> Path:
+            name = re.sub(r"[\\/:*?\"<>|]", "_", Path(raw_name).name)
+            target = directory / name
+            return directory / f"{index:03d}_{name}" if target.exists() else target
+
+        forward_paths: list[str] = []
+        backward_paths: list[str] = []
+        plan_paths: list[str] = []
+        try:
+            for index, (upload, _, filename) in enumerate(forward_entries, 1):
+                target = unique_target(forward_dir, filename, index)
+                await save_pdf(upload, target)
+                forward_paths.append(str(target))
+            for index, (upload, _, filename) in enumerate(backward_entries, 1):
+                target = unique_target(backward_dir, filename, index)
+                await save_pdf(upload, target)
+                backward_paths.append(str(target))
+            if plan_entries:
+                plan_dir.mkdir(parents=True, exist_ok=True)
+                for index, (upload, _, filename) in enumerate(plan_entries, 1):
+                    target = unique_target(plan_dir, filename, index)
+                    await save_plan_file(upload, target)
+                    plan_paths.append(str(target))
+        except Exception:
+            if folder.exists() and not any(folder.iterdir()):
+                shutil.rmtree(folder, ignore_errors=True)
+            raise
+        finally:
+            for upload in project_files:
+                if id(upload) not in accepted_ids:
+                    await upload.close()
+        payload = {"项目编码": code, "项目目录": str(folder), "前向文件": forward_paths,
+                   "后向合同": backward_paths, "后向合同数量": len(backward_paths),
+                   "收入收款计划": plan_paths, "忽略文件": ignored, "处理状态": "已上传"}
+        if process_now:
+            task_id = uuid.uuid4().hex
+            update_task(task_id, project_code=code, status="排队中",
+                        stage="项目文件夹已归类保存，等待开始", progress=10,
                         created_at=datetime.now().isoformat(timespec="seconds"))
             background_tasks.add_task(run_review_task, task_id, code, overwrite)
             payload.update({"处理状态": "后台处理中", "task_id": task_id,

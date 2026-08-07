@@ -19,7 +19,8 @@ PROCUREMENT_TABLE_HEADER_RE = re.compile(
     re.S,
 )
 DESCRIPTIVE_PROCUREMENT_HEADER_RE = re.compile(
-    r"序\s*号.{0,30}采购\s*内容.{0,30}技术\s*参数.{0,30}数\s*量.{0,20}单\s*位",
+    r"序\s*号.{0,30}(?:采购\s*内容|名\s*称).{0,40}(?:技术\s*参数|技术\s*要求).{0,80}"
+    r"(?:(?:数\s*量.{0,30}单\s*位)|(?:单\s*位.{0,30}数\s*量))",
     re.S,
 )
 PRICE_TABLE_HEADER_RE = re.compile(
@@ -242,6 +243,28 @@ def _descriptive_name_and_parameters(first: str, following: list[str]) -> tuple[
     """Split a descriptive procurement row into its short name and long specification."""
     first = re.sub(r"\s+", " ", first).strip()
     inline_parameter = ""
+    short_parameter = re.match(
+        r"^(?P<name>.+?)\s+(?P<parameter>\d+(?:\.\d+)?\s*[KMG](?:bps)?)$",
+        first,
+        re.I,
+    )
+    if short_parameter:
+        first = short_parameter.group("name")
+        inline_parameter = short_parameter.group("parameter")
+    enumerated_parameter = re.match(
+        r"^(?P<name>.{2,60}?)(?P<parameter>[（(]\d+[）)].*(?:内存|存储|数据|支持|接口|网口).*)$",
+        first,
+    )
+    if enumerated_parameter:
+        first = enumerated_parameter.group("name")
+        inline_parameter = enumerated_parameter.group("parameter")
+    threshold_parameter = re.match(
+        r"^(?P<name>.{2,60}?)\s+(?P<parameter>(?:不低于|不少于|不小于|≥|≤).+)$",
+        first,
+    )
+    if threshold_parameter:
+        first = threshold_parameter.group("name")
+        inline_parameter = threshold_parameter.group("parameter")
     inline = re.match(r"^(?P<name>[^\s，,；;：:]{2,40})\s+(?P<parameter>.+[，,；;。])$", first)
     if inline:
         first = inline.group("name")
@@ -264,14 +287,29 @@ def _descriptive_name_and_parameters(first: str, following: list[str]) -> tuple[
 
 def _descriptive_procurement_rows(
         pages: list[PageText]) -> tuple[list[dict[str, Any]], set[tuple[str, int]]]:
-    """Parse cross-page tables laid out as 采购内容/技术参数/数量/单位."""
+    """Parse cross-page descriptive quote tables in either unit/quantity order."""
     rows: list[dict[str, Any]] = []
     consumed: set[tuple[str, int]] = set()
     active = False
     current_file = ""
     section = "设备部分"
     expected_row = 1
-    product_units = "台|套|个|块|只|批|系统|项|组|路|点|端|授权|根|副"
+    product_units = "|".join(sorted(set((UNITS + "|座").split("|")), key=len, reverse=True))
+    compound_unit = r"(?:\s*/\s*(?:\d*\s*年|百米|公里))?"
+    quantity_first_re = re.compile(
+        rf"(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>{product_units}){compound_unit}(?=\s|$|[，,；;。])"
+    )
+    unit_first_re = re.compile(
+        rf"(?P<unit>{product_units}){compound_unit}\s*(?P<qty>\d+(?:\.\d+)?)(?=\s|$|[，,；;。])"
+    )
+    price_tail = (r"\s+(?:(?P<brand>[\u4e00-\u9fffA-Za-z0-9/.-]{1,20})\s+(?P<model>.+?)\s+)?"
+                  r"(?P<net_unit>\d+(?:\.\d+)?)\s+(?P<tax>\d{1,2}%)")
+    priced_quantity_first_re = re.compile(
+        rf"(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>{product_units}){compound_unit}{price_tail}"
+    )
+    priced_unit_first_re = re.compile(
+        rf"(?P<unit>{product_units}){compound_unit}\s*(?P<qty>\d+(?:\.\d+)?){price_tail}"
+    )
 
     def parse_segment(lines: list[str], page: PageText, row_start: int, group: str) -> int:
         starts: list[tuple[int, int, str]] = []
@@ -285,14 +323,18 @@ def _descriptive_procurement_rows(
         for row_index, (start, number, first) in enumerate(starts):
             end = starts[row_index + 1][0] if row_index + 1 < len(starts) else len(lines)
             block_lines = [first] + lines[start + 1:end]
-            quantity_matches = list(re.finditer(
-                rf"(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>{product_units})(?=\s|$|[，,；;。])",
-                "\n".join(block_lines),
-            ))
+            block_text = "\n".join(block_lines)
+            priced_matches = list(priced_quantity_first_re.finditer(block_text))
+            priced_matches.extend(priced_unit_first_re.finditer(block_text))
+            quantity_matches = priced_matches or list(quantity_first_re.finditer(block_text))
+            if not priced_matches:
+                quantity_matches.extend(unit_first_re.finditer(block_text))
             if not quantity_matches:
                 continue
-            quantity = quantity_matches[-1]
-            before_quantity = "\n".join(block_lines)[:quantity.start()]
+            # Technical requirements often contain measurements. The contractual
+            # row quantity is the final unit/quantity pair before brand and price.
+            quantity = max(quantity_matches, key=lambda match: match.start())
+            before_quantity = block_text[:quantity.start()]
             body_lines = [re.sub(r"\s+", " ", line).strip()
                           for line in before_quantity.splitlines() if line.strip()]
             if not body_lines:
@@ -300,13 +342,19 @@ def _descriptive_procurement_rows(
             name, parameters = _descriptive_name_and_parameters(body_lines[0], body_lines[1:])
             if not name or len(name) > 80:
                 continue
+            brand = _clean_table_text(quantity.groupdict().get("brand") or "")
+            model = _clean_table_text(quantity.groupdict().get("model") or "")
+            if not model and re.fullmatch(r"\d+(?:\.\d+)?\s*[KMG](?:bps)?", parameters, re.I):
+                model = _clean_table_text(parameters)
             rows.append({
                 "row_number": number,
                 "section": group,
                 "name": name,
                 "technical_parameters": parameters,
                 "quantity": float(quantity.group("qty")),
-                "unit": quantity.group("unit"),
+                "unit": _clean_table_text(quantity.group("unit")),
+                "brand": brand,
+                "model": model,
                 "file_name": page.file_name,
                 "page": page,
             })
@@ -319,7 +367,7 @@ def _descriptive_procurement_rows(
             section = "设备部分"
             expected_row = 1
         has_header = bool(DESCRIPTIVE_PROCUREMENT_HEADER_RE.search(page.text))
-        if has_header and "明细报价表" in page.text:
+        if has_header and re.search(r"(?:明细报价表|报价明细表)", page.text):
             active = True
             section = "设备部分"
             expected_row = 1
@@ -576,6 +624,8 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
         price_index = price_indexes.get(file_name, 0)
         file_prices = price_rows_by_file.get(file_name, [])
         price = file_prices[price_index] if price_index < len(file_prices) else {}
+        if row.get("brand") or row.get("model"):
+            price = {**price, "brand": row.get("brand", ""), "model": row.get("model", "")}
         price_indexes[file_name] = price_index + 1
         page = row["page"]
         name = row["name"]

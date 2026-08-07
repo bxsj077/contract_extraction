@@ -162,13 +162,11 @@ def _milestone_summary(plan: dict[str, Any], node: str) -> tuple[str, str]:
     status = str(detail.get("计算状态") or "合同未约定该节点").strip()
     if calculated:
         return calculated, calculated
-    if relative:
-        return _compact_clause(relative), ""
+    if re.search(r"时间异常|日期异常|早于项目起算|早于.*完工", status):
+        return NO_CONTRACT_RULE, ""
     raw = str(detail.get("原文") or "").strip()
-    if raw:
-        return _milestone_requirement(raw, node, status), ""
-    if status and not re.search(r"合同未约定|未提取", status):
-        return _milestone_requirement("", node, status), ""
+    if raw or relative or (status and not re.search(r"合同未约定|未提取", status)):
+        return f"合同提及{node}，未明确日期", ""
     return NO_CONTRACT_RULE, ""
 
 

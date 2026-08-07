@@ -263,13 +263,16 @@ class ReviewStore:
 
     def dashboard(self) -> dict[str, int]:
         projects = self.list_projects()
-        issues = self.list_issues()
         payloads = [p["payload"] for p in projects]
-        diffs = [d for p in payloads for key in ("equipment_differences", "schedule_differences", "scope_differences") for d in p.get(key, [])]
+        elevated = {"中风险", "高风险"}
+        equipment = [d for p in payloads for d in p.get("equipment_differences", [])]
+        schedule = [d for p in payloads for d in p.get("schedule_differences", [])]
+        scopes = [d for p in payloads for d in p.get("scope_differences", [])]
+        all_diffs = [d for p in payloads for key in ("equipment_differences", "schedule_differences", "scope_differences", "plan_differences") for d in p.get(key, [])]
         return {"项目总数": len(projects), "已完成对比项目数": sum(p["status"] == "已完成" for p in projects),
                 "解析失败项目数": sum(p["status"] == "处理失败" for p in projects),
                 "高风险项目数": sum(p["risk_level"] == "高风险" for p in projects),
-                "设备缺项数量": sum(d.get("status") == "后向未采购" for d in diffs),
-                "工期风险数量": sum(d.get("category") == "工期" and d.get("risk_level") in {"高风险", "中风险"} for d in diffs),
-                "实施内容缺项数量": sum(d.get("status") == "实施内容缺失" for d in diffs),
-                "待人工复核数量": sum(i["status"] == "待复核" for i in issues)}
+                "设备缺项数量（中高风险）": sum(d.get("risk_level") in elevated for d in equipment),
+                "工期风险数量（中高风险）": sum(d.get("risk_level") in elevated for d in schedule),
+                "实施内容缺项数量（中高风险）": sum(d.get("risk_level") in elevated for d in scopes),
+                "待人工复核数量（中高风险）": sum(d.get("risk_level") in elevated and d.get("needs_review") for d in all_diffs)}

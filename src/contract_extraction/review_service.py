@@ -21,7 +21,7 @@ from .system_models import ContractStructured, ProjectFiles, ProjectReviewResult
 
 
 LOGGER = logging.getLogger("contract_review")
-PARSE_VERSION = "2026.08-v12-compact-procurement-multi-backward"
+PARSE_VERSION = "2026.08-v13-flexible-quote-equipment"
 CORRECTABLE_FIELDS = {
     "contract_number", "contract_name", "party_a", "party_b", "amount_yuan", "sign_date", "effective_date", "contract_type",
     "procurement_involved", "procurement_note", "time_plan.duration_value", "time_plan.duration_unit",
@@ -188,8 +188,10 @@ class ReviewService:
                     calculated, basis_name = calculated_nodes.get("到货"), "到货日期"
                 elif re.search(r"初验|初步验收", prefix):
                     calculated, basis_name = calculated_nodes.get("初验"), "初验日期"
+                elif re.search(r"项目完工|项目完成|整体完工|整体完成", prefix):
+                    calculated, basis_name = overall_finish, "项目整体完成日期"
                 else:
-                    calculated, basis_name = start_date, "项目起算日期"
+                    calculated, basis_name = None, "基准日期"
                 if calculated:
                     calculated, note = calculate_end_date(calculated, relative[0], relative[1])
                     if calculated:
@@ -210,7 +212,8 @@ class ReviewService:
             "终验", {"原文": "", "相对期限": "", "计算日期": "", "计算状态": "合同未约定该节点"})
         final_explicit = final_detail.get("计算状态") == "合同约定了明确日期"
         finish_date = self._iso_date(plan.finish_date)
-        if finish_date and not final_manual and not final_explicit and not final_detail.get("相对期限"):
+        final_calculated = self._iso_date(final_detail.get("计算日期") or plan.milestones.get("终验"))
+        if finish_date and not final_manual and not final_explicit and not final_calculated:
             plan.milestones["终验"] = finish_date.isoformat()
             final_detail["计算日期"] = finish_date.isoformat()
             final_detail["计算状态"] = "按项目整体工期完成日推算终验日期"
@@ -246,11 +249,17 @@ class ReviewService:
             applied.append({"id": correction["id"], "contract_key": contract_key, "field_path": field_path,
                             "corrected_value": value, "note": correction.get("note", ""),
                             "updated_at": correction.get("updated_at", "")})
-        if not applied:
-            return contract
+        if "time_plan.duration_raw" not in corrected_paths and contract.time_plan.duration_value is not None:
+            duration_evidence = next((item for item in contract.evidence if item.field_name == "工期原文"), None)
+            if duration_evidence and duration_evidence.value:
+                evidence_text = str(duration_evidence.value)
+                evidence_number = re.search(r"工期.{0,30}?([0-9]{1,4})\s*(?:个?工作日|日历日|日历天|天|日|个月|月|年)", evidence_text)
+                if evidence_number and int(evidence_number.group(1)) == int(contract.time_plan.duration_value):
+                    contract.time_plan.duration_raw = evidence_text
         self._recalculate_timeline(contract, corrected_paths)
-        contract.parse_metadata["applied_corrections"] = applied
-        contract.parse_metadata["correction_count"] = len(applied)
+        if applied:
+            contract.parse_metadata["applied_corrections"] = applied
+            contract.parse_metadata["correction_count"] = len(applied)
         return contract
 
     def _apply_finding_overrides(self, project_code: str, category: str, findings: list) -> list:

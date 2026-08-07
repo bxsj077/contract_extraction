@@ -46,7 +46,7 @@ class ReviewSystemTests(unittest.TestCase):
         self.assertEqual(_duration_display(plan), "90天")
         self.assertEqual(_milestone_summary(plan, "到货"), ("2026-04-06", "2026-04-06"))
         self.assertEqual(_milestone_summary(plan, "初验"), ("合同中无明确规定", ""))
-        self.assertEqual(_milestone_summary(plan, "终验"), ("项目完工后30日内", ""))
+        self.assertEqual(_milestone_summary(plan, "终验"), ("合同提及终验，未明确日期", ""))
         row = _contract_time_row("P1", "前向", {"contract_name": "示例合同", "time_plan": plan})
         self.assertEqual(row["签订日期"], "合同中无明确规定")
 
@@ -58,7 +58,7 @@ class ReviewSystemTests(unittest.TestCase):
         }
         plan["milestones"].pop("到货", None)
         self.assertEqual(_milestone_summary(plan, "到货"),
-                         ("供货完成并初验合格后（未明确日期）", ""))
+                         ("合同提及到货，未明确日期", ""))
 
         plan["milestone_details"]["到货"] = {
             "原文": "交货后终验质保合格之日起3年，日期2026年1月27日",
@@ -78,6 +78,7 @@ class ReviewSystemTests(unittest.TestCase):
             self.assertEqual(config["合同上传根目录"], str(root))
             self.assertEqual(config["审查结果目录"], str(output))
             self.assertTrue(root.exists())
+
             self.assertTrue(any(getattr(route, "path", "") == "/api/tasks/{task_id}" for route in app.routes))
             self.assertTrue(any(getattr(route, "path", "") == "/api/tasks" for route in app.routes))
             self.assertTrue(any(getattr(route, "path", "") == "/api/projects/{project_code}" and
@@ -94,6 +95,34 @@ class ReviewSystemTests(unittest.TestCase):
             self.assertIn({"field_path": "amount_yuan", "label": "合同金额（元）", "group": "合同基本信息"}, fields)
             self.assertTrue(any(item["field_path"] == "time_plan.milestone_details.到货.计算日期"
                                 and item["group"] == "时间节点" for item in fields))
+
+    def test_dashboard_counts_only_medium_and_high_risk_findings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ReviewStore(root / "review.db")
+            payload = {
+                "equipment_differences": [
+                    {"risk_level": "高风险", "needs_review": False},
+                    {"risk_level": "待确认", "needs_review": True},
+                ],
+                "schedule_differences": [
+                    {"risk_level": "中风险", "needs_review": True},
+                    {"risk_level": "无风险", "needs_review": False},
+                ],
+                "scope_differences": [
+                    {"risk_level": "高风险", "needs_review": True},
+                    {"risk_level": "待确认", "needs_review": True},
+                ],
+                "plan_differences": [{"risk_level": "中风险", "needs_review": True}],
+            }
+            store.upsert_project("P1", str(root / "P1"), "已完成", "高风险", payload)
+
+            result = store.dashboard()
+
+            self.assertEqual(result["设备缺项数量（中高风险）"], 1)
+            self.assertEqual(result["工期风险数量（中高风险）"], 1)
+            self.assertEqual(result["实施内容缺项数量（中高风险）"], 1)
+            self.assertEqual(result["待人工复核数量（中高风险）"], 3)
 
     def test_dismissed_equipment_finding_is_persisted_until_project_delete(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -349,6 +378,39 @@ class ReviewSystemTests(unittest.TestCase):
         self.assertEqual(items[4].technical_parameters["增值税税率"], "6%")
         self.assertEqual(len(evidence), 5)
 
+    def test_quote_detail_table_with_unit_before_quantity_and_embedded_model_is_extracted(self):
+        pages = [
+            PageText("后向.pdf", "后向.pdf", 26, "\n".join([
+                "溧水区信息化项目报价明细表",
+                "序号 名称 技术要求 单位 数量 品牌 型号 增值税税率",
+                "1 防火视频分析器 支持在线检测； 台 21 恩博 NB320-QRS111 62100.00 13% 70173.00",
+                "2 电箱 防护等级不低于IP55； 套 21 恩博 NB200 3566.00 13% 4029.58",
+                "3 森林防火视频云端识别分析服务器（本地部署）(3)存储盘：≥64GB 台 1 恩博 NB-YDFWQ1 54272.00 13% 61327.36",
+            ]), "原生文本层", confidence=1.0),
+            PageText("后向.pdf", "后向.pdf", 27, "\n".join([
+                "4 森林防火支架1 不低于3米 个 3 国产 定制 3880.00 13% 4384.40",
+                "设备部分合计 3258206",
+            ]), "原生文本层", confidence=1.0),
+        ]
+        items = _extract_equipment("P1", "后向", pages, [])
+        self.assertEqual(len(items), 4)
+        self.assertEqual((items[0].standard_name, items[0].model, items[0].quantity),
+                         ("防火视频分析器", "NB320-QRS111", 21))
+        self.assertEqual(items[2].standard_name, "森林防火视频云端识别分析服务器（本地部署）")
+        self.assertEqual(items[3].standard_name, "森林防火支架1")
+
+    def test_quote_detail_table_with_quantity_before_unit_uses_short_parameter_as_model(self):
+        page = PageText("后向.pdf", "后向.pdf", 24, "\n".join([
+            "溧水区信息化项目报价明细表",
+            "序号 采购内容 技术参数 数量 单位 增值税税率",
+            "1 专线1 20M 20 根/2年 12226.42 6% 12960 244528.30 259200.00",
+            "2 专线2 200M 1 根/2年 63396.23 6% 67200 63396.23 67200.00",
+            "总计（最高含税限价326400元）",
+        ]), "原生文本层", confidence=1.0)
+        items = _extract_equipment("P1", "后向", [page], [])
+        self.assertEqual([(item.standard_name, item.model, item.quantity, item.unit) for item in items],
+                         [("专线1", "20M", 20, "根"), ("专线2", "200M", 1, "根")])
+
     def test_quantity_first_procurement_table_is_extracted_across_pages(self):
         header = "序号 名称 数量 单位 品牌 型号 增值税税率 含税单价（元） 含税总价（元）"
         pages = [
@@ -537,6 +599,20 @@ class ReviewSystemTests(unittest.TestCase):
             EquipmentItem(standard_name="设备安装集成服务 1", unit="项", quantity=16, evidence_id="B1"),
             EquipmentItem(standard_name="中间模块服务", unit="套", quantity=2, evidence_id="B2"),
             EquipmentItem(standard_name="监控设备维护服务", unit="项", quantity=3, evidence_id="B3"),
+        ]
+        self.assertEqual(compare_equipment(f, b), [])
+
+    def test_equipment_quote_aliases_and_models_embedded_in_names_match(self):
+        f, b = self.contract("前向"), self.contract("后向汇总")
+        f.equipment = [
+            EquipmentItem(standard_name="专线电信 20M", unit="根", quantity=20, evidence_id="F1"),
+            EquipmentItem(standard_name="避雷针国产 1.2 米", unit="根", quantity=20, evidence_id="F2"),
+            EquipmentItem(standard_name="恩博 NB-YDFWQ", unit="台", quantity=1, evidence_id="F3"),
+        ]
+        b.equipment = [
+            EquipmentItem(standard_name="专线1", model="20M", unit="根", quantity=20, evidence_id="B1"),
+            EquipmentItem(standard_name="接闪器", model="定制", unit="根", quantity=20, evidence_id="B2"),
+            EquipmentItem(standard_name="云端识别服务器", model="NB-YDFWQ1", unit="台", quantity=1, evidence_id="B3"),
         ]
         self.assertEqual(compare_equipment(f, b), [])
 
