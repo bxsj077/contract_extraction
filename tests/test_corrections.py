@@ -4,7 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from contract_extraction.api import _classify_folder_upload_path, _normalize_duration_correction
+from contract_extraction.api import (
+    _classify_batch_folder_upload_path,
+    _classify_folder_upload_path,
+    _normalize_duration_correction,
+)
 from contract_extraction.models import PageText
 from contract_extraction.review_service import ReviewService
 from contract_extraction.structured import _extract_time_plan
@@ -27,6 +31,22 @@ class CorrectionTests(unittest.TestCase):
         )
         self.assertIsNone(_classify_folder_upload_path("P001/说明/README.txt"))
         self.assertIsNone(_classify_folder_upload_path("P001/../前向/合同.pdf"))
+
+    def test_batch_folder_upload_paths_use_first_child_as_project_code(self):
+        self.assertEqual(
+            _classify_batch_folder_upload_path("合同总目录/P001/前向/前向合同.pdf"),
+            ("P001", "前向", "前向合同.pdf"),
+        )
+        self.assertEqual(
+            _classify_batch_folder_upload_path("合同总目录/P002/后向/供应商A/采购合同.pdf"),
+            ("P002", "后向", "采购合同.pdf"),
+        )
+        self.assertEqual(
+            _classify_batch_folder_upload_path("合同总目录/P002/收入收款计划/收款计划.xlsx"),
+            ("P002", "收入收款计划", "收款计划.xlsx"),
+        )
+        self.assertIsNone(_classify_batch_folder_upload_path("P001/前向/合同.pdf"))
+        self.assertIsNone(_classify_batch_folder_upload_path("总目录/P001/../前向/合同.pdf"))
 
     def test_manual_duration_text_becomes_conclusion_not_number(self):
         value, conclusion = _normalize_duration_correction("供货要求等合同文件另有约定")

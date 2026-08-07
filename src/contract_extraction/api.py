@@ -70,6 +70,14 @@ def _classify_folder_upload_path(relative_path: str) -> tuple[str, str, str] | N
     return (project_code, category, filename) if category else None
 
 
+def _classify_batch_folder_upload_path(relative_path: str) -> tuple[str, str, str] | None:
+    """Classify `<batch root>/<project>/<category>/<file>` directory uploads."""
+    parts = [part for part in relative_path.replace("\\", "/").split("/") if part not in {"", "."}]
+    if len(parts) < 4 or any(part == ".." for part in parts):
+        return None
+    return _classify_folder_upload_path("/".join(parts[1:]))
+
+
 def create_app(contract_root: Path | None = None, output_root: Path | None = None) -> FastAPI:
     project_root = Path(__file__).resolve().parents[2]
     root = contract_root or Path(os.getenv("CONTRACT_ROOT", str(project_root / "data" / "contracts")))
@@ -362,6 +370,116 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
             payload.update({"处理状态": "后台处理中", "task_id": task_id,
                             "任务查询地址": f"/api/tasks/{task_id}"})
         return payload
+
+    @app.post("/api/projects/upload-batch-folder")
+    async def upload_batch_project_folder(background_tasks: BackgroundTasks,
+                                          project_files: list[UploadFile] = File(...),
+                                          relative_paths: list[str] = Form(...),
+                                          overwrite: bool = Query(False), process_now: bool = Query(True)):
+        if not project_files or len(project_files) != len(relative_paths):
+            raise HTTPException(400, "批量目录文件与相对路径数量不一致，请重新选择总目录")
+        if (service.contract_root / "前向").is_dir() or (service.contract_root / "后向").is_dir():
+            raise HTTPException(400, "当前服务绑定的是单项目目录，不能执行多项目批量导入")
+
+        grouped: dict[str, list[tuple[UploadFile, str, str, str]]] = {}
+        ignored: list[str] = []
+        for upload, relative_path in zip(project_files, relative_paths):
+            classified = _classify_batch_folder_upload_path(relative_path)
+            if not classified:
+                ignored.append(relative_path)
+                continue
+            code, category, filename = classified
+            grouped.setdefault(code.strip(), []).append((upload, category, filename, relative_path))
+        if not grouped:
+            raise HTTPException(400, "总目录下未找到符合“项目/前向、后向、收入收款计划”结构的文件")
+
+        def valid_code(code: str) -> bool:
+            return bool(code and len(code) <= 100 and not re.search(r"[\\/:*?\"<>|]", code)
+                        and code not in {".", ".."})
+
+        def unique_target(directory: Path, raw_name: str, index: int) -> Path:
+            name = re.sub(r"[\\/:*?\"<>|]", "_", Path(raw_name).name)
+            target = directory / name
+            return directory / f"{index:03d}_{name}" if target.exists() else target
+
+        imported: list[dict[str, object]] = []
+        skipped: list[dict[str, str]] = []
+        try:
+            for code, entries in sorted(grouped.items()):
+                if not valid_code(code):
+                    skipped.append({"项目编码": code or "未命名项目", "原因": "项目文件夹名称不是有效项目编码"})
+                    continue
+                forward_entries = [entry for entry in entries
+                                   if entry[1] == "前向" and Path(entry[2]).suffix.lower() == ".pdf"]
+                backward_entries = [entry for entry in entries
+                                    if entry[1] == "后向" and Path(entry[2]).suffix.lower() == ".pdf"]
+                plan_entries = [entry for entry in entries if entry[1] == "收入收款计划"
+                                and Path(entry[2]).suffix.lower() in {".xls", ".xlsx", ".xml"}]
+                accepted = forward_entries + backward_entries + plan_entries
+                accepted_ids = {id(entry[0]) for entry in accepted}
+                ignored.extend(entry[3] for entry in entries if id(entry[0]) not in accepted_ids)
+                if not forward_entries or not backward_entries:
+                    missing = "前向PDF" if not forward_entries else "后向PDF"
+                    skipped.append({"项目编码": code, "原因": f"缺少{missing}"})
+                    continue
+
+                folder = service.contract_root / code
+                if folder.exists() and not overwrite and any(folder.iterdir()):
+                    skipped.append({"项目编码": code, "原因": "项目已存在，未勾选覆盖"})
+                    continue
+                forward_dir, backward_dir, plan_dir = folder / "前向", folder / "后向", folder / "收入收款计划"
+                if overwrite:
+                    shutil.rmtree(forward_dir, ignore_errors=True)
+                    shutil.rmtree(backward_dir, ignore_errors=True)
+                    shutil.rmtree(plan_dir, ignore_errors=True)
+                forward_dir.mkdir(parents=True, exist_ok=True)
+                backward_dir.mkdir(parents=True, exist_ok=True)
+                forward_paths: list[str] = []
+                backward_paths: list[str] = []
+                plan_paths: list[str] = []
+                try:
+                    for index, (upload, _, filename, _) in enumerate(forward_entries, 1):
+                        target = unique_target(forward_dir, filename, index)
+                        await save_pdf(upload, target)
+                        forward_paths.append(str(target))
+                    for index, (upload, _, filename, _) in enumerate(backward_entries, 1):
+                        target = unique_target(backward_dir, filename, index)
+                        await save_pdf(upload, target)
+                        backward_paths.append(str(target))
+                    if plan_entries:
+                        plan_dir.mkdir(parents=True, exist_ok=True)
+                        for index, (upload, _, filename, _) in enumerate(plan_entries, 1):
+                            target = unique_target(plan_dir, filename, index)
+                            await save_plan_file(upload, target)
+                            plan_paths.append(str(target))
+                except Exception as exc:
+                    shutil.rmtree(folder, ignore_errors=True)
+                    skipped.append({"项目编码": code, "原因": f"文件保存失败：{exc}"})
+                    continue
+
+                item: dict[str, object] = {
+                    "项目编码": code, "项目目录": str(folder), "前向文件数量": len(forward_paths),
+                    "后向合同数量": len(backward_paths), "收入收款计划数量": len(plan_paths),
+                    "处理状态": "已上传",
+                }
+                if process_now:
+                    task_id = uuid.uuid4().hex
+                    update_task(task_id, project_code=code, status="排队中",
+                                stage="批量目录已归类保存，等待开始", progress=10,
+                                created_at=datetime.now().isoformat(timespec="seconds"))
+                    background_tasks.add_task(run_review_task, task_id, code, overwrite)
+                    item.update({"处理状态": "后台处理中", "task_id": task_id})
+                imported.append(item)
+        finally:
+            for upload in project_files:
+                await upload.close()
+
+        if not imported:
+            details = "；".join(f"{item['项目编码']}：{item['原因']}" for item in skipped[:8])
+            raise HTTPException(400, f"没有可导入项目。{details}")
+        return {"导入项目数量": len(imported), "跳过项目数量": len(skipped), "项目": imported,
+                "跳过项目": skipped, "忽略文件": ignored,
+                "处理状态": "后台处理中" if process_now else "已上传"}
 
     @app.get("/api/dashboard")
     def dashboard():
