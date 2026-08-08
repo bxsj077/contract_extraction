@@ -1,0 +1,26 @@
+{
+  "native_text_min_chars": 80,
+  "native_text_min_cjk": 20,
+  "ocr_dpi": 300,
+  "signature_dpi": 600,
+  "ocr_review_threshold": 0.90,
+  "classification_margin": 2,
+  "allow_partial_signing_date": true,
+  "signing_date_policy": "latest_recognized",
+  "max_summary_chars": 1200,
+  "safety_buffer_days": 15,
+  "rule_version": "2026.08-v1-business-rules-unchanged",
+  "ocr_v2": {
+    "engine": "rapidocr",
+    "normal_dpi": 300,
+    "retry_dpi": 450,
+    "signature_dpi": 600,
+    "retry_mean_confidence": 0.90,
+    "retry_key_field_confidence": 0.88,
+    "table_engine": "auto",
+    "enable_table_detection": true,
+    "enable_smart_retry": true,
+    "enable_signature_fusion": true,
+    "enable_ppstructure": false
+  }
+}

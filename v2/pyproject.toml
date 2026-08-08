@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contract-extraction-v2"
+version = "2.0.0"
+description = "Local-first Chinese contract OCR, structured extraction and delivery-risk review V2"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "fastapi>=0.110,<1",
+  "uvicorn>=0.29,<1",
+  "pydantic>=2.6,<3",
+  "python-multipart>=0.0.9,<1",
+  "openpyxl>=3.1,<4",
+  "Pillow>=10,<12",
+  "pypdf>=5,<7",
+  "PyMuPDF>=1.24,<2",
+  "rapidocr>=3.9,<4",
+  "onnxruntime>=1.17,<2",
+  "numpy>=1.24,<3",
+]
+
+[project.optional-dependencies]
+table = [
+  "paddleocr>=3.0,<4",
+  "paddlepaddle>=3.0,<4",
+]
+test = [
+  "pytest>=8,<9",
+  "httpx>=0.27,<1",
+]
+
+[project.scripts]
+contract-extract-v2 = "contract_extraction_v2.cli:main"
+contract-review-v2 = "contract_extraction_v2.review_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+contract_extraction_v2 = ["web/*.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
