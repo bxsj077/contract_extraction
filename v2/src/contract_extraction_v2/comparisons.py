@@ -165,6 +165,8 @@ def _name_key(value: str) -> str:
 
 def _semantic_equipment_class(value: str) -> str:
     normalized = _name_key(value)
+    if "支架" in normalized:
+        return "支架"
     if "避雷针" in normalized:
         return "避雷针"
     if "挂载" in normalized or "安装集成" in normalized:
@@ -174,6 +176,19 @@ def _semantic_equipment_class(value: str) -> str:
     if "维护" in normalized:
         return "维护"
     return ""
+
+
+def _dimension_tokens(item) -> set[str]:
+    """Extract explicit metre dimensions from a name or technical description."""
+    text = " ".join([
+        str(item.standard_name or ""),
+        str(item.original_name or ""),
+        *[str(value) for value in (item.technical_parameters or {}).values()],
+    ])
+    return {
+        f"{float(value):g}米"
+        for value in re.findall(r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:米|m)(?![A-Za-z])", text, re.I)
+    }
 
 
 def _name_score(forward, backward) -> float:
@@ -284,8 +299,15 @@ def _equipment_pair_score(forward, backward) -> tuple[float, dict[str, float]] |
     backward_model_known = _known_text(backward.model)
     brands_known = _known_text(forward.brand) and _known_text(backward.brand)
     brand_conflict = brands_known and brand < .55
+    forward_dimensions = _dimension_tokens(forward)
+    backward_dimensions = _dimension_tokens(backward)
 
     if brand_conflict:
+        return None
+
+    # A shared generic name such as “森林防火支架” is insufficient when both
+    # contracts explicitly state different physical dimensions.
+    if forward_dimensions and backward_dimensions and forward_dimensions.isdisjoint(backward_dimensions):
         return None
 
     # Known but clearly different models must not be rescued by a generic name.

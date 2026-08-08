@@ -12,7 +12,7 @@ def test_service_term_classifier(name):
     assert is_service_content(name)
 
 
-def test_service_table_row_is_not_procurement_device():
+def test_table_rows_do_not_bypass_v1_business_parser():
     page = PageText(
         "报价表.pdf", "报价表.pdf", 1, "服务清单", "OCR bbox表格恢复", 0.96,
         table_rows=[{
@@ -22,6 +22,17 @@ def test_service_table_row_is_not_procurement_device():
         }],
     )
     items = _extract_equipment("P001", "后向", [page], [])
-    service = next(item for item in items if item.standard_name == "软件部署实施")
-    assert service.category == "软件/服务"
-    assert service.list_type == "实施服务内容"
+    assert items == []
+
+
+def test_server_name_is_procurement_equipment_not_service():
+    page = PageText(
+        "报价表.pdf", "报价表.pdf", 1,
+        "序号 采购内容 数量 单位 品牌 型号\n"
+        "1 存储服务器 1 台 海康 DS-AS72024R",
+        "原生文本层", 0.99,
+    )
+    items = _extract_equipment("P002", "后向", [page], [])
+    server = next(item for item in items if item.standard_name == "存储服务器")
+    assert server.category == "设备"
+    assert server.model == "DS-AS72024R"

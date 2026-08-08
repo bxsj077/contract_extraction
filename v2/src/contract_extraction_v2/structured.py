@@ -5,7 +5,6 @@ from dataclasses import asdict
 from datetime import date, timedelta
 from typing import Any
 
-from .inventory import deduplicate_inventory_rows, is_service_content
 from .models import ContractOutput, PageText
 from .system_models import ContractStructured, EquipmentItem, EvidenceRef, ScopeItem, TimePlan
 
@@ -551,110 +550,16 @@ def _quantity_first_procurement_rows(
     return rows, consumed
 
 
-def _table_row_value(row: dict[str, Any], key: str) -> str:
-    value = row.get(key, "")
-    return re.sub(r"\s+", " ", str(value or "")).strip()
-
-
-def _fallback_table_fields(row: dict[str, Any]) -> tuple[str, str, str, str, float | None]:
-    cells = [str(cell).strip() for cell in row.get("cells", []) if str(cell).strip()]
-    working = [cell for cell in cells if not re.fullmatch(r"\d{1,4}", cell)]
-    unit = next((cell for cell in cells if re.fullmatch(rf"(?:{UNITS})", re.sub(r"\s+", "", cell))), "")
-    quantity: float | None = None
-    for index, cell in enumerate(cells):
-        if unit and cell == unit and index > 0 and re.fullmatch(r"\d+(?:\.\d+)?", cells[index - 1]):
-            quantity = float(cells[index - 1])
-            break
-        if unit and cell == unit and index + 1 < len(cells) and re.fullmatch(r"\d+(?:\.\d+)?", cells[index + 1]):
-            quantity = float(cells[index + 1])
-            break
-    model = next((cell for cell in cells if re.search(r"[A-Za-z]", cell)
-                  and re.search(r"\d", cell) and len(cell) >= 3), "")
-    candidates = [cell for cell in working if cell not in {unit, model}
-                  and re.search(r"[\u4e00-\u9fffA-Za-z]", cell)]
-    name = candidates[0] if candidates else ""
-    brand = candidates[1] if len(candidates) > 1 and len(candidates[1]) <= 20 else ""
-    return name, brand, model, unit, quantity
-
-
-def _structured_table_equipment(
-    project: str,
-    direction: str,
-    pages: list[PageText],
-    evidence: list[EvidenceRef],
-) -> list[EquipmentItem]:
-    enriched: list[dict[str, Any]] = []
-    for page in pages:
-        for row in page.table_rows:
-            enriched.append({
-                **row, "来源文件": page.file_name, "页码": page.page,
-                "清单类型": row.get("清单类型") or "采购交付清单",
-            })
-    rows = deduplicate_inventory_rows(enriched)
-    items: list[EquipmentItem] = []
-    for row in rows:
-        name = _table_row_value(row, "名称")
-        brand = _table_row_value(row, "品牌")
-        model = _table_row_value(row, "型号")
-        unit = re.sub(r"\s+", "", _table_row_value(row, "单位"))
-        quantity_text = _table_row_value(row, "数量")
-        quantity_match = re.search(r"\d+(?:\.\d+)?", quantity_text.replace(",", ""))
-        quantity = float(quantity_match.group()) if quantity_match else None
-        if not name:
-            name, inferred_brand, inferred_model, inferred_unit, inferred_quantity = _fallback_table_fields(row)
-            brand = brand or inferred_brand
-            model = model or inferred_model
-            unit = unit or inferred_unit
-            quantity = quantity if quantity is not None else inferred_quantity
-        if not name or not re.search(r"[\u4e00-\u9fffA-Za-z]", name):
-            continue
-        # A valid inventory row needs at least a quantity/unit or a model.  This
-        # prevents ordinary multi-column body text from becoming an item.
-        if quantity is None and not unit and not model:
-            continue
-        source_file = str(row.get("来源文件") or "")
-        page_no = row.get("页码") or ""
-        page = next((item for item in pages if item.file_name == source_file and item.page == page_no), None)
-        confidence = float(row.get("confidence") or (page.confidence if page else 0.9) or 0.9)
-        list_type = "现场备件库清单" if page and "现场备件库清单" in page.text else "采购交付清单"
-        service = is_service_content(name) or bool(re.search(r"软件|平台|授权|服务|实施|集成|运维|培训", name))
-        category = "软件/服务" if service else ("备件" if list_type == "现场备件库清单" else "设备")
-        if service:
-            list_type = "实施服务内容"
-        ev_id = f"EV-{project}-{direction}-ITEM-{len(items)+1:04d}"
-        quote = "结构化表格：" + "，".join(filter(None, [
-            f"名称{name}", f"品牌{brand}" if brand else "", f"型号{model}" if model else "",
-            f"数量{quantity:g}{unit}" if quantity is not None else f"单位{unit}" if unit else "",
-        ]))
-        evidence.append(EvidenceRef(
-            ev_id, project, direction,
-            "实施服务内容" if service else "设备材料清单", name,
-            source_file, page_no, quote,
-            (page.method if page else "OCR bbox表格恢复"), confidence, confidence < .9,
-        ))
-        items.append(EquipmentItem(
-            category, name, name, brand, model, unit, quantity,
-            {"结构化来源": row.get("source_engine", "ocr_boxes"), "OCR单元格": row.get("cells", [])},
-            direction, ev_id, confidence, list_type,
-        ))
-    return items
-
-
 def _extract_equipment(project: str, direction: str, pages: list[PageText], evidence: list[EvidenceRef]) -> list[EquipmentItem]:
-    items: list[EquipmentItem] = _structured_table_equipment(project, direction, pages, evidence)
-    seen: set[tuple[str, str, float | None, str, int | str]] = {
-        (item.standard_name, item.model, item.quantity,
-         next((ev.file_name for ev in evidence if ev.evidence_id == item.evidence_id), ""),
-         next((ev.page for ev in evidence if ev.evidence_id == item.evidence_id), ""))
-        for item in items
-    }
+    items: list[EquipmentItem] = []
+    seen: set[tuple[str, str, float | None]] = set()
     simple_rows, simple_pages = _simple_procurement_rows(pages)
     for row in simple_rows:
         page = row["page"]
         name = row["name"]
         qty = row["quantity"]
         unit = row["unit"]
-        key = (name, row["model"], qty, page.file_name, page.page)
+        key = (name, row["model"], qty)
         if key in seen:
             continue
         seen.add(key)
@@ -664,7 +569,7 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
         evidence.append(EvidenceRef(ev_id, project, direction, "设备材料清单", name, page.file_name, page.page,
                                     quote, page.method, page.confidence or "",
                                     bool(page.confidence and page.confidence < .9)))
-        category = "软件/服务" if re.search(r"软件|平台|模块|算法|服务|实施|集成|运维|运营", name) else "设备"
+        category = "软件/服务" if re.search(r"软件|平台|模块|算法|服务(?!器)|实施|集成|运维|运营", name) else "设备"
         items.append(EquipmentItem(category, name, name, row["brand"], row["model"], unit, qty,
                                    {}, direction, ev_id, float(page.confidence or .9),
                                    "采购交付清单"))
@@ -674,7 +579,7 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
         name = row["name"]
         qty = row["quantity"]
         unit = row["unit"]
-        key = (name, row["model"], qty, page.file_name, page.page)
+        key = (name, row["model"], qty)
         if key in seen:
             continue
         seen.add(key)
@@ -684,7 +589,7 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
         evidence.append(EvidenceRef(ev_id, project, direction, "设备材料清单", name, page.file_name, page.page,
                                     quote, page.method, page.confidence or "",
                                     bool(page.confidence and page.confidence < .9)))
-        category = "软件/服务" if re.search(r"软件|平台|模块|授权|服务|实施|集成|运维", name) else "设备"
+        category = "软件/服务" if re.search(r"软件|平台|模块|授权|服务(?!器)|实施|集成|运维", name) else "设备"
         items.append(EquipmentItem(category, name, name, row["brand"], row["model"], unit, qty,
                                    {}, direction, ev_id, float(page.confidence or .9),
                                    "采购交付清单"))
@@ -694,7 +599,7 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
         name = row["name"]
         qty = row["quantity"]
         unit = row["unit"]
-        key = (name, row["model"], qty, page.file_name, page.page)
+        key = (name, row["model"], qty)
         if key in seen:
             continue
         seen.add(key)
@@ -707,7 +612,7 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
         parameters = {"清单分组": row["section"], "增值税税率": row["增值税税率"],
                       "含税单价": row["含税单价"], "含税总价": row["含税总价"]}
         category = "软件/服务" if row["section"] == "服务部分" or re.search(
-            r"软件|平台|模块|授权|服务|实施|集成|运维", name) else "设备"
+            r"软件|平台|模块|授权|服务(?!器)|实施|集成|运维", name) else "设备"
         items.append(EquipmentItem(category, name, name, row["brand"], row["model"], unit, qty,
                                    parameters, direction, ev_id, float(page.confidence or .9),
                                    "采购交付清单"))
@@ -726,7 +631,7 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
         name = row["name"]
         qty = row["quantity"]
         unit = row["unit"]
-        key = (name, price.get("model", ""), qty, page.file_name, page.page)
+        key = (name, price.get("model", ""), qty)
         if key in seen:
             continue
         seen.add(key)
@@ -741,7 +646,7 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
             parameters["技术参数"] = row["technical_parameters"]
         parameters.update({key: value for key, value in price.items() if key not in {"brand", "model"}})
         category = "软件/服务" if row["section"] == "服务部分" or re.search(
-            r"软件|平台|模块|授权|服务|实施|集成|运维", name) else "设备"
+            r"软件|平台|模块|授权|服务(?!器)|实施|集成|运维", name) else "设备"
         items.append(EquipmentItem(category, name, name, price.get("brand", ""), price.get("model", ""),
                                    unit, qty, parameters, direction, ev_id,
                                    float(page.confidence or .9), "采购交付清单"))
@@ -818,7 +723,7 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
                     continue
                 qty_text = parsed.group("qty") + (parsed.group("qty_tail") or "")
                 qty = float(qty_text)
-                key = (name, "", qty, page.file_name, page.page)
+                key = (name, "", qty)
                 if key in seen:
                     continue
                 seen.add(key)
@@ -839,7 +744,7 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
             if not EQUIPMENT_WORDS.search(name) or re.search(r"项目合同|合同签订|签订地", name):
                 continue
             qty = float(match.group("qty"))
-            key = (name, match.group("model") or "", qty, page.file_name, page.page)
+            key = (name, match.group("model") or "", qty)
             if key in seen:
                 continue
             seen.add(key)
@@ -867,7 +772,7 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
             else:
                 name = raw_name
             qty = float(match.group("qty"))
-            key = (name, "", qty, page.file_name, page.page)
+            key = (name, "", qty)
             if key in seen:
                 continue
             seen.add(key)
@@ -918,7 +823,7 @@ def _extract_equipment(project: str, direction: str, pages: list[PageText], evid
                 split_extra = re.search(r"原\s*厂\s*质\s*保\s*(\d{1,3})", body[quantity_match.end():])
                 if split_extra:
                     qty += float(split_extra.group(1))
-            key = (name, "", qty, page.file_name, page.page)
+            key = (name, "", qty)
             if key in seen:
                 continue
             seen.add(key)

@@ -42,6 +42,21 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(result["合同性质"], "运维类")
         self.assertEqual(result["工期原文"], "")
 
+    def test_contract_name_falls_back_to_standalone_cover_title(self):
+        cover = page(
+            "江苏中烟工业有限责任公司\n"
+            "安全子领域数字化转型一期建设项目主合同\n"
+            "合同签订地点：江苏省南京市\n"
+            "买方：江苏中烟工业有限责任公司\n"
+            "卖方：中电鸿信信息科技有限公司\n"
+            "本项目包含系统集成、设备采购和安装调试。"
+        )
+        result = analyze_contract(
+            "HT003", "HT003", [cover], [{"文件名": "主合同.pdf"}], "fp",
+            {"classification_margin": 2, "max_summary_chars": 800}, [],
+        ).result
+        self.assertEqual(result["合同名称"], "安全子领域数字化转型一期建设项目主合同")
+
     def test_calendar_days(self):
         from datetime import date
         end, note = calculate_end_date(date(2026, 5, 29), 30, "日")

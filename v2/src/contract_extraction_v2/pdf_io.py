@@ -17,7 +17,7 @@ from .ocr.page_classifier import PageType, classify_page
 from .ocr.ppstructure import PPStructureV3Adapter
 from .ocr.preprocess import preprocess_by_name, preprocess_signature
 from .ocr.quality import analyze_text_quality, assess_ocr_quality
-from .ocr.table_parser import build_table_rows
+from .ocr.table_parser import build_table_rows, group_lines_by_y
 
 
 OUTPUT_NAMES = {
@@ -70,9 +70,34 @@ def text_quality(text: str, min_chars: int = 80, min_cjk: int = 20) -> dict[str,
         "chars": quality.total_chars,
         "cjk": quality.cjk_chars,
         "replacement": quality.replacement_chars,
-        "usable": quality.content_usable and quality.structure_usable,
+        "usable": _v1_native_text_usable(text, min_chars, min_cjk),
     })
     return data
+
+
+def _v1_native_text_usable(text: str, min_chars: int, min_cjk: int) -> bool:
+    """Preserve the exact V1 decision boundary for business-input selection."""
+
+    compact = re.sub(r"\s+", "", text or "")
+    cjk = len(re.findall(r"[\u3400-\u9fff]", compact))
+    replacement = compact.count("�")
+    return (
+        len(compact) >= min_chars
+        and cjk >= min_cjk
+        and replacement <= max(2, len(compact) * 0.01)
+    )
+
+
+def _ocr_visual_text(lines: list[OcrResultLine], page_type: PageType) -> str:
+    """Improve OCR reading order without introducing business-field mapping."""
+
+    if page_type not in {PageType.TABLE, PageType.MIXED}:
+        return "\n".join(line.text for line in lines)
+    rows = group_lines_by_y(lines)
+    positioned = {id(cell) for row in rows for cell in row}
+    visual = [" ".join(cell.text for cell in row if cell.text.strip()) for row in rows]
+    visual.extend(line.text for line in lines if id(line) not in positioned and line.text.strip())
+    return "\n".join(line for line in visual if line.strip())
 
 
 class LocalOcr:
@@ -283,12 +308,13 @@ def extract_pdf_pages(
     for page_index, native in enumerate(native_pages):
         page_no = page_index + 1
         quality = analyze_text_quality(native, min_chars, min_cjk)
+        native_v1_usable = _v1_native_text_usable(native, min_chars, min_cjk)
         classification = classify_page(native, native_quality=quality)
         page_type = classification.page_type
-        # Avoid classifying every final page as a signature page; a signature
-        # hint is required.  The classifier can still return MIXED for a tabled
-        # signature block.
-        if SIGNATURE_HINT.search(native) and page_type == PageType.NORMAL:
+        # Keep V1's final-page signature coverage while fusing instead of
+        # appending duplicate native/normal/enhanced OCR text.
+        signature_candidate = bool(SIGNATURE_HINT.search(native)) or page_no >= max(1, len(native_pages) - 2)
+        if signature_candidate and page_type == PageType.NORMAL:
             page_type = PageType.SIGNATURE
         methods: list[str] = []
         lines: list[OcrResultLine] = []
@@ -313,15 +339,18 @@ def extract_pdf_pages(
                 "signature_score": classification.signature_score,
                 "reasons": classification.reasons,
             },
+            "v1_native_text_usable": native_v1_usable,
         }
         try:
             needs_ocr = (
-                not (quality.content_usable and quality.structure_usable)
+                not native_v1_usable
                 or (bool(settings.get("enable_table_detection", True)) and page_type in {PageType.TABLE, PageType.MIXED})
                 or page_type in {PageType.SIGNATURE, PageType.MIXED}
             )
-            if not needs_ocr:
+            if native_v1_usable:
                 methods.append("原生文本层")
+            if not needs_ocr:
+                selected_text = native.strip()
             else:
                 first, first_mean, first_meta = _cached_ocr_v2(
                     pdf, file_hash, page_index, normal_dpi, cache, ocr,
@@ -383,8 +412,17 @@ def extract_pdf_pages(
                     diagnostics["table_diagnostics"] = table_diag
                 if page_type in {PageType.SIGNATURE, PageType.MIXED}:
                     selected_text = merge_native_and_ocr_text(native, lines)
+                elif native_v1_usable:
+                    # Critical compatibility rule: OCR/table diagnostics may be
+                    # richer, but V1-usable native text remains the sole
+                    # business parser input.
+                    selected_text = native.strip()
                 elif lines:
-                    selected_text = "\n".join(line.text for line in lines)
+                    selected_text = (
+                        merge_native_and_ocr_text(native, lines)
+                        if native.strip()
+                        else _ocr_visual_text(lines, page_type)
+                    )
                 elif native.strip():
                     selected_text = native.strip()
                     methods.append("原生文本层回退")

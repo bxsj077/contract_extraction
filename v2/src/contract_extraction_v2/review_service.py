@@ -28,7 +28,7 @@ from .system_models import ContractStructured, ProjectFiles, ProjectReviewResult
 
 
 LOGGER = logging.getLogger("contract_review")
-PARSE_VERSION = "2026.08-ocr-v2-ppocrv6-table-rows"
+PARSE_VERSION = "2026.08-ocr-v2-server-device-v4"
 CORRECTABLE_FIELDS = {
     "contract_number", "contract_name", "party_a", "party_b", "amount_yuan", "sign_date", "effective_date", "contract_type",
     "procurement_involved", "procurement_note", "time_plan.duration_value", "time_plan.duration_unit",

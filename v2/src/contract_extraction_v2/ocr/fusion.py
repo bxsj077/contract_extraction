@@ -58,16 +58,16 @@ def merge_ocr_results(*result_sets: list[OcrResultLine]) -> list[OcrResultLine]:
 
 
 def merge_native_and_ocr_text(native_text: str, lines: list[OcrResultLine]) -> str:
-    """Merge without repeating OCR/native copies of the same logical line."""
+    """Keep V1's native-first evidence order while removing OCR duplicates."""
 
-    selected = [line.text.strip() for line in lines if line.text.strip()]
+    selected = [line.strip() for line in native_text.splitlines() if line.strip()]
     normalized_selected = [_normalized(line) for line in selected]
-    for native_line in (line.strip() for line in native_text.splitlines() if line.strip()):
-        norm = _normalized(native_line)
+    for ocr_line in (line.text.strip() for line in lines if line.text.strip()):
+        norm = _normalized(ocr_line)
         if not norm:
             continue
         if any(SequenceMatcher(None, norm, other).ratio() >= 0.92 for other in normalized_selected):
             continue
-        selected.append(native_line)
+        selected.append(ocr_line)
         normalized_selected.append(norm)
     return "\n".join(selected)

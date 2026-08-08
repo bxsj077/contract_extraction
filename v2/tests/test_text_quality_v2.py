@@ -1,4 +1,5 @@
 from contract_extraction_v2.ocr.quality import analyze_text_quality
+from contract_extraction_v2.pdf_io import _v1_native_text_usable
 
 
 def test_normal_contract_body_is_usable():
@@ -38,3 +39,8 @@ def test_fragmented_native_table_has_poor_structure():
     assert quality.content_usable
     assert not quality.structure_usable
     assert quality.short_line_ratio > 0.6
+
+
+def test_v1_usable_boundary_is_preserved_for_business_input():
+    text = "合同双方应按约定履行设备交付、安装调试和验收义务。" * 10
+    assert _v1_native_text_usable(text, 80, 20)

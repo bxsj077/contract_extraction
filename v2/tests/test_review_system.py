@@ -589,6 +589,33 @@ class ReviewSystemTests(unittest.TestCase):
                                      unit="套", quantity=17, evidence_id="B")]
         self.assertEqual(compare_equipment(f, b), [])
 
+    def test_bracket_height_in_technical_description_matches_forward_name(self):
+        f, b = self.contract("前向"), self.contract("后向")
+        f.equipment = [
+            EquipmentItem(standard_name="3米森林防火支架定制3米", unit="个", quantity=3, evidence_id="F1"),
+            EquipmentItem(standard_name="5米森林防火支架定制5米", unit="个", quantity=1, evidence_id="F2"),
+        ]
+        b.equipment = [
+            EquipmentItem(standard_name="森林防火支架1", brand="国产", model="定制", unit="个", quantity=3,
+                          technical_parameters={"技术参数": "不低于3米"}, evidence_id="B1"),
+            EquipmentItem(standard_name="森林防火支架2", brand="国产", model="定制", unit="个", quantity=1,
+                          technical_parameters={"技术参数": "不低于5米"}, evidence_id="B2"),
+        ]
+        self.assertEqual(compare_equipment(f, b), [])
+
+    def test_different_explicit_bracket_heights_do_not_cross_match(self):
+        f, b = self.contract("前向"), self.contract("后向")
+        f.equipment = [
+            EquipmentItem(standard_name="3米森林防火支架", unit="个", quantity=1, evidence_id="F1"),
+        ]
+        b.equipment = [
+            EquipmentItem(standard_name="森林防火支架", model="定制", unit="个", quantity=1,
+                          technical_parameters={"技术参数": "不低于5米"}, evidence_id="B1"),
+        ]
+        result = compare_equipment(f, b)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].status, "后向未找到")
+
     def test_equipment_matching_rejects_conflicting_brand_even_when_model_matches(self):
         f, b = self.contract("前向"), self.contract("后向")
         f.equipment = [EquipmentItem(standard_name="核心交换机", brand="华为", model="S6730",

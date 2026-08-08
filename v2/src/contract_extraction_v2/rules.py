@@ -81,11 +81,26 @@ def classify(pages: list[PageText], margin: int = 2) -> tuple[str, str, int, int
 def _extract_header(pages: list[PageText], field: str, labels: tuple[str, ...]) -> tuple[str, PageText | None, str]:
     pattern = re.compile(rf"(?:{'|'.join(map(re.escape, labels))})\s*[：:]\s*([^\n。；]{{2,100}})")
     found = _page_for(pages[:8], pattern.search)
-    if not found:
+    if found:
+        page, match = found
+        value = match.group(1).strip(" ：:，,")
+        return value, page, _snippet(page.text, match.start(), match.end(), 35)
+    if field != "合同名称":
         return "", None, ""
-    page, match = found
-    value = match.group(1).strip(" ：:，,")
-    return value, page, _snippet(page.text, match.start(), match.end(), 35)
+
+    # Some contract covers use a standalone title instead of a labelled
+    # ``合同名称：...`` field.  Keep the labelled rule first, then inspect only
+    # the top of the first three pages so body clauses cannot become a title.
+    excluded = re.compile(r"合同(?:签订|签署|生效|编号|金额|价款)|本合同|[甲乙双]方|买方|卖方")
+    title_shape = re.compile(r"(?:项目.{0,50}(?:主合同|补充合同|合同|协议)|.{2,70}(?:主合同|补充合同|采购合同|服务合同|协议))$")
+    for page in pages[:3]:
+        for raw_line in page.text.splitlines()[:30]:
+            value = re.sub(r"\s+", "", raw_line).strip(" ：:，,。")
+            if not 4 <= len(value) <= 100 or excluded.search(value):
+                continue
+            if title_shape.search(value):
+                return value, page, raw_line.strip()
+    return "", None, ""
 
 
 def _find_milestone(pages: list[PageText], words: tuple[str, ...]) -> tuple[str, PageText | None, str]:
