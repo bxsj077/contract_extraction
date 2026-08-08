@@ -96,7 +96,7 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
         service.store.save_task(task)
         return task
 
-    def run_review_task(task_id: str, code: str, overwrite: bool) -> None:
+    def run_review_task(task_id: str, code: str, force: bool = False) -> None:
         task = app.state.tasks[task_id]
         try:
             task = update_task(task_id, status="运行中", stage="正在枚举前向及后向合同", progress=20,
@@ -106,7 +106,7 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
                 raise RuntimeError("上传目录中未找到该项目")
             task = update_task(task_id, stage=f"正在逐份执行OCR解析和履约风险审查（前向{len(found[0].forward_pdfs)}份、后向{len(found[0].backward_pdfs)}份）",
                                progress=45, forward_count=len(found[0].forward_pdfs), backward_count=len(found[0].backward_pdfs))
-            result = service.process_project(found[0], force=overwrite)
+            result = service.process_project(found[0], force=force)
             if result.status == "处理失败":
                 detail = "；".join(x.get("description", "") for x in result.review_issues) or "项目处理失败"
                 raise RuntimeError(detail)
@@ -274,7 +274,9 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
             update_task(task_id, project_code=code, status="排队中",
                         stage="合同文件已保存，等待开始", progress=10,
                         created_at=datetime.now().isoformat(timespec="seconds"))
-            background_tasks.add_task(run_review_task, task_id, code, overwrite)
+            # “覆盖已有文件”只控制上传目录，不等于强制重做OCR；文件指纹
+            # 变化时缓存会自动失效，相同文件则直接复用解析及OCR缓存。
+            background_tasks.add_task(run_review_task, task_id, code, False)
             payload.update({"处理状态": "后台处理中", "task_id": task_id,
                             "任务查询地址": f"/api/tasks/{task_id}"})
         return payload
@@ -366,7 +368,7 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
             update_task(task_id, project_code=code, status="排队中",
                         stage="项目文件夹已归类保存，等待开始", progress=10,
                         created_at=datetime.now().isoformat(timespec="seconds"))
-            background_tasks.add_task(run_review_task, task_id, code, overwrite)
+            background_tasks.add_task(run_review_task, task_id, code, False)
             payload.update({"处理状态": "后台处理中", "task_id": task_id,
                             "任务查询地址": f"/api/tasks/{task_id}"})
         return payload
@@ -467,7 +469,7 @@ def create_app(contract_root: Path | None = None, output_root: Path | None = Non
                     update_task(task_id, project_code=code, status="排队中",
                                 stage="批量目录已归类保存，等待开始", progress=10,
                                 created_at=datetime.now().isoformat(timespec="seconds"))
-                    background_tasks.add_task(run_review_task, task_id, code, overwrite)
+                    background_tasks.add_task(run_review_task, task_id, code, False)
                     item.update({"处理状态": "后台处理中", "task_id": task_id})
                 imported.append(item)
         finally:

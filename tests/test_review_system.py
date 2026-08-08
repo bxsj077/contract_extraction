@@ -6,7 +6,8 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-from contract_extraction.comparisons import compare_equipment, compare_schedule, compare_scopes
+from contract_extraction.comparisons import (compare_equipment, compare_schedule, compare_scopes,
+                                             project_overall_risk)
 from contract_extraction.api import create_app
 from contract_extraction.review_export import (_contract_time_row, _duration_display, _header_cn,
                                                 _milestone_summary, export_project_reviews, export_review)
@@ -588,6 +589,56 @@ class ReviewSystemTests(unittest.TestCase):
                                      unit="套", quantity=17, evidence_id="B")]
         self.assertEqual(compare_equipment(f, b), [])
 
+    def test_equipment_matching_rejects_conflicting_brand_even_when_model_matches(self):
+        f, b = self.contract("前向"), self.contract("后向")
+        f.equipment = [EquipmentItem(standard_name="核心交换机", brand="华为", model="S6730",
+                                     unit="台", quantity=1, evidence_id="F")]
+        b.equipment = [EquipmentItem(standard_name="核心交换机", brand="锐捷", model="S6730",
+                                     unit="台", quantity=1, evidence_id="B")]
+        result = compare_equipment(f, b)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].status, "后向未找到")
+
+    def test_equipment_description_disambiguates_quantity_candidates(self):
+        f, b = self.contract("前向"), self.contract("后向汇总")
+        f.equipment = [EquipmentItem(standard_name="网络交换设备", unit="台", quantity=10,
+                                     technical_parameters={"技术参数": "48口万兆上联交换机"}, evidence_id="F")]
+        b.equipment = [
+            EquipmentItem(standard_name="网络交换设备", unit="台", quantity=10,
+                          technical_parameters={"技术参数": "无线控制器及AP管理许可"}, evidence_id="B1"),
+            EquipmentItem(standard_name="网络交换设备", unit="台", quantity=6,
+                          technical_parameters={"技术参数": "48口万兆上联交换机"}, evidence_id="B2"),
+        ]
+        result = compare_equipment(f, b)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].status, "后向数量不足")
+        self.assertEqual(result[0].backward["汇总数量"], 6)
+        self.assertIn("描述", result[0].backward["匹配依据"])
+
+    def test_equipment_matching_aggregates_quantity_across_backward_contracts(self):
+        f, b = self.contract("前向"), self.contract("后向汇总")
+        f.equipment = [EquipmentItem(standard_name="汇聚交换机", brand="锐捷", model="RG-S6150",
+                                     unit="台", quantity=10, evidence_id="F")]
+        b.equipment = [
+            EquipmentItem(standard_name="汇聚交换机", brand="锐捷", model="RG-S6150",
+                          unit="台", quantity=4, evidence_id="B1"),
+            EquipmentItem(standard_name="汇聚交换机", brand="锐捷", model="RG-S6150",
+                          unit="台", quantity=6, evidence_id="B2"),
+        ]
+        self.assertEqual(compare_equipment(f, b), [])
+
+    def test_legacy_service_rows_do_not_enter_equipment_coverage(self):
+        f, b = self.contract("前向"), self.contract("后向")
+        f.equipment = [
+            EquipmentItem(category="设备", standard_name="设备安装集成国产优质项目配套 180",
+                          unit="项", quantity=17, evidence_id="F1"),
+            EquipmentItem(category="设备", standard_name="报警核实服务国产优质项目配套 180",
+                          unit="路", quantity=26, evidence_id="F2"),
+            EquipmentItem(category="设备", standard_name="森林防火边缘检测算法国产优质项目配套 180",
+                          unit="项", quantity=1, evidence_id="F3"),
+        ]
+        self.assertEqual(compare_equipment(f, b), [])
+
     def test_equipment_semantic_alias_and_quantity_match(self):
         f, b = self.contract("前向"), self.contract("后向汇总")
         f.equipment = [
@@ -640,6 +691,20 @@ class ReviewSystemTests(unittest.TestCase):
         self.assertEqual(result[0].status, "后向工期晚于前向")
         self.assertEqual(result[0].risk_level, "高风险")
         self.assertIn("后向晚10天", result[0].description)
+
+    def test_project_overall_risk_only_escalates_core_delivery_risks(self):
+        equipment = Difference("设备", "后向未找到", "高风险", "EQ-001", "交换机", "", {}, {})
+        delivery = Difference("时间节点", "后向到货晚于前向", "高风险", "TM-002", "到货（后向合同1）", "", {}, {})
+        acceptance = Difference("时间节点", "后向终验晚于前向", "高风险", "TM-004", "终验（后向合同1）", "", {}, {})
+        start = Difference("工期", "前后向时间条件不一致", "中风险", "TM-005", "起算条件", "", {}, {})
+        scope = Difference("实施内容", "实施内容缺失", "高风险", "SC-001", "软件部署", "", {}, {})
+        self.assertEqual(project_overall_risk([equipment], [], [], []), "高风险")
+        self.assertEqual(project_overall_risk([], [delivery], [], []), "高风险")
+        self.assertEqual(project_overall_risk([], [start], [], []), "中风险")
+        self.assertEqual(project_overall_risk([], [acceptance], [], []), "低风险")
+        self.assertEqual(project_overall_risk([], [], [scope], []), "低风险")
+        self.assertEqual(project_overall_risk([], [], [], [], review_issue_count=1), "低风险")
+        self.assertEqual(project_overall_risk([], [], [], []), "无风险")
 
     def test_schedule_missing_never_says_satisfied(self):
         result = compare_schedule(self.contract("前向"), self.contract("后向"))[0]

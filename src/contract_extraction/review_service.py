@@ -8,7 +8,14 @@ from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from .comparisons import RESPONSIBILITY_SCORE, compare_equipment, compare_schedule, compare_scopes, overall_risk
+from .comparisons import (
+    RESPONSIBILITY_SCORE,
+    compare_equipment,
+    compare_schedule,
+    compare_scopes,
+    overall_risk,
+    project_overall_risk,
+)
 from .date_utils import calculate_end_date
 from .pdf_io import LocalOcr, extract_pdf_pages, sha256_file
 from .pipeline import load_config
@@ -437,7 +444,14 @@ class ReviewService:
             else:
                 status = "仅完成单向解析" if forward or backward else "处理失败"
             all_diffs = equipment + schedule + scopes + plan_differences
-            risk = overall_risk(all_diffs)
+
+            risk = project_overall_risk(
+                equipment_differences=equipment,
+                schedule_differences=schedule,
+                scope_differences=scopes,
+                plan_differences=plan_differences,
+                review_issue_count=len(project.issues),
+            )
             review_issues = [{"category": "项目完整性", "description": issue} for issue in project.issues]
             for contract in ([forward] if forward else []) + backward_contracts:
                 review_issues.extend({"category": f"{contract.direction}合同解析", "description": issue} for issue in contract.review_issues if issue)

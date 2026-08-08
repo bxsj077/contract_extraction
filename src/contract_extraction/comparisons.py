@@ -7,13 +7,140 @@ from difflib import SequenceMatcher
 
 from .system_models import ContractStructured, Difference, ScopeItem
 
+NON_EQUIPMENT_CATEGORIES = {
+    "软件/服务",
+    "服务对象",
+    "备件",
+}
 
+NON_EQUIPMENT_LIST_TYPES = {
+    "维保/服务对象清单",
+    "现场备件库清单",
+}
+
+def project_overall_risk(
+    equipment_differences: list[Difference],
+    schedule_differences: list[Difference],
+    scope_differences: list[Difference],
+    plan_differences: list[Difference],
+    review_issue_count: int = 0,
+) -> str:
+    """
+    计算项目级总体风险。
+
+    项目级高/中风险仅由以下核心履约因素触发：
+    1. 工期风险；
+    2. 到货风险；
+    3. 前向设备/材料清单未被后向完整覆盖。
+
+    初验、终验、实施内容、收入收款计划以及普通待复核事项，
+    仍保留各自明细风险等级，但最多只将项目总体风险提升到“低风险”。
+    """
+
+    # ---------------------------------------------------------
+    # 1. 设备/材料覆盖风险
+    # ---------------------------------------------------------
+    # compare_equipment 当前只返回真正未覆盖、数量不足等差异，
+    # 因此只要出现高风险设备差异，就认为项目存在核心履约风险。
+    if any(
+        item.risk_level == "高风险"
+        for item in equipment_differences
+    ):
+        return "高风险"
+
+    # 为以后设备规则支持“中风险”预留
+    if any(
+        item.risk_level == "中风险"
+        for item in equipment_differences
+    ):
+        return "中风险"
+
+    # ---------------------------------------------------------
+    # 2. 工期 / 到货
+    # ---------------------------------------------------------
+    critical_schedule = []
+
+    for item in schedule_differences:
+        # 工期，包括：
+        # - 工期本身
+        # - 起算条件
+        if item.category == "工期":
+            critical_schedule.append(item)
+            continue
+
+        # 到货在 compare_schedule 中 category 是“时间节点”，
+        # 因此需要通过 title 判断
+        if (
+            item.category == "时间节点"
+            and str(item.title).startswith("到货")
+        ):
+            critical_schedule.append(item)
+
+    if any(
+        item.risk_level == "高风险"
+        for item in critical_schedule
+    ):
+        return "高风险"
+
+    if any(
+        item.risk_level == "中风险"
+        for item in critical_schedule
+    ):
+        return "中风险"
+
+    # ---------------------------------------------------------
+    # 3. 其他问题最多定义为低风险
+    # ---------------------------------------------------------
+    other_findings = (
+        equipment_differences
+        + schedule_differences
+        + scope_differences
+        + plan_differences
+    )
+
+    has_other_problem = any(
+        item.risk_level in {
+            "高风险",
+            "中风险",
+            "待确认",
+        }
+        for item in other_findings
+    )
+
+    if has_other_problem or review_issue_count > 0:
+        return "低风险"
+
+    return "无风险"
+
+def _is_equipment_coverage_item(item) -> bool:
+    """
+    判断一个清单项是否应该进入“设备未覆盖风险”比较。
+
+    软件实施、系统集成、运维服务等服务类项目，
+    不属于设备，不参与设备覆盖判断。
+    """
+    if item.category in NON_EQUIPMENT_CATEGORIES:
+        return False
+
+    if item.list_type in NON_EQUIPMENT_LIST_TYPES:
+        return False
+
+    # 兼容旧缓存中尚未正确写入 category 的服务类清单项。这里只影响
+    # “设备未覆盖”比较，不删除结构化结果，实施和服务信息仍会保留。
+    name = str(item.standard_name or item.original_name or "")
+    if re.search(r"软件|平台(?:开发|服务)|算法|中间件|部署实施|(?:系统|安装)集成|运维|运营费|维护服务|服务(?!器)|挂载费", name):
+        return False
+    if (item.unit in {"项", "路"} and not item.brand and not item.model
+            and re.search(r"平台|费用|费$|其他.*项目配套", name)):
+        return False
+
+    return True
 RESPONSIBILITY_SCORE = {"负责完成": 6, "组织实施": 5, "承担": 5, "提供": 4, "配合": 2, "协助": 1, "不明确": 0}
-RISK_ORDER = {"无风险": 0, "待确认": 1, "中风险": 2, "高风险": 3}
+RISK_ORDER = {"无风险": 0, "低风险": 1, "待确认": 1, "中风险": 2, "高风险": 3}
 
 
 def _norm(value: str) -> str:
-    return re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", value.lower()).replace("设备", "").replace("系统", "")
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", str(value or "").lower()).replace("设备", "").replace("系统", "")
 
 
 def _model_score(forward, backward) -> float:
@@ -76,43 +203,244 @@ def _name_score(forward, backward) -> float:
     return SequenceMatcher(None, left, right).ratio()
 
 
-def _matched_candidates(forward, backward_items):
-    model_matches = [item for item in backward_items if _model_score(forward, item) >= .78]
-    if model_matches:
-        return model_matches, "型号"
-    name_matches = [item for item in backward_items if _name_score(forward, item) >= .62]
-    return name_matches, "名称"
+def _known_text(value: str) -> bool:
+    return _norm(value) not in {"", "无", "未知", "未提供", "不详", "/", "-"}
 
 
-def compare_equipment(forward: ContractStructured, backward: ContractStructured) -> list[Difference]:
-    """Return only forward items that cannot be found in any backward contract.
+def _brand_score(forward, backward) -> float:
+    left, right = _norm(forward.brand), _norm(backward.brand)
+    if not left and not right:
+        return .5
+    if not left or not right:
+        return .6
+    if left == right:
+        return 1.0
+    shorter, longer = sorted((left, right), key=len)
+    if len(shorter) >= 2 and shorter in longer:
+        return .9
+    return SequenceMatcher(None, left, right).ratio()
 
-    Matching prioritizes model plus quantity across the aggregated backward
-    contracts, then falls back to a reliable normalized-name plus quantity
-    match. Backward-only items do not create a difference row.
+
+def _description_text(item) -> str:
+    """Return normalized product description, excluding price and grouping metadata."""
+    parts = [item.original_name or ""]
+    ignored = {"清单分组", "含税单价", "含税总价", "增值税税率", "单价", "总价", "税率"}
+    for key, value in sorted((item.technical_parameters or {}).items()):
+        if key in ignored or value in (None, "", [], {}):
+            continue
+        if isinstance(value, (dict, list, tuple, set)):
+            value = str(value)
+        parts.append(f"{key}{value}")
+    return _norm(" ".join(str(part) for part in parts))
+
+
+def _description_score(forward, backward) -> float:
+    left, right = _description_text(forward), _description_text(backward)
+    if not left and not right:
+        return .5
+    if not left or not right:
+        return .5
+    if left == right:
+        return 1.0
+    shorter, longer = sorted((left, right), key=len)
+    if len(shorter) >= 8 and shorter in longer:
+        return max(.82, len(shorter) / len(longer))
+    return SequenceMatcher(None, left, right).ratio()
+
+
+def _quantity_score(forward, backward) -> float:
+    left, right = forward.quantity, backward.quantity
+    if left is None or right is None:
+        return .5
+    if left == right:
+        return 1.0
+    if left <= 0 or right <= 0:
+        return 0.0
+    ratio = min(left, right) / max(left, right)
+    return max(ratio, .8 if right >= left else 0.0)
+
+
+def _unit_score(forward, backward) -> float:
+    left, right = _norm(forward.unit), _norm(backward.unit)
+    if not left or not right:
+        return .5
+    return 1.0 if left == right else 0.0
+
+
+def _equipment_pair_score(forward, backward) -> tuple[float, dict[str, float]] | None:
+    """Score one forward/backward pair using model, brand, name, description and quantity.
+
+    Model remains the primary identity. Brand conflicts reject weak/fuzzy model
+    matches, while description and quantity are used to disambiguate OCR variants
+    and generic product names.
     """
+    model = _model_score(forward, backward)
+    name = _name_score(forward, backward)
+    brand = _brand_score(forward, backward)
+    description = _description_score(forward, backward)
+    quantity = _quantity_score(forward, backward)
+    unit = _unit_score(forward, backward)
+    forward_model_known = _known_text(forward.model)
+    backward_model_known = _known_text(backward.model)
+    brands_known = _known_text(forward.brand) and _known_text(backward.brand)
+    brand_conflict = brands_known and brand < .55
+
+    if brand_conflict:
+        return None
+
+    # Known but clearly different models must not be rescued by a generic name.
+    if forward_model_known and backward_model_known and model < .65:
+        return None
+
+    if model >= .92:
+        pass
+    elif model >= .78:
+        if max(name, description) < .48 and brand < .82:
+            return None
+    else:
+        if name < .72 and not (name >= .62 and description >= .65):
+            return None
+
+    score = (.45 * model + .18 * name + .14 * brand
+             + .13 * description + .07 * quantity + .03 * unit)
+    if model < .78:
+        score = (.37 * name + .22 * description + .17 * brand
+                 + .14 * quantity + .10 * unit)
+    details = {"型号": model, "品牌": brand, "名称": name,
+               "描述": description, "数量": quantity, "单位": unit}
+    return score, details
+
+
+def _matched_candidates(forward, backward_items):
+    ranked = []
+    for item in backward_items:
+        scored = _equipment_pair_score(forward, item)
+        if scored:
+            score, details = scored
+            ranked.append((score, item, details))
+    if not ranked:
+        return [], "品牌、型号、数量及描述综合匹配"
+
+    ranked.sort(key=lambda row: row[0], reverse=True)
+    best_score = ranked[0][0]
+    best_has_model = ranked[0][2]["型号"] >= .78
+    tolerance = .12 if best_has_model else .08
+    selected = [row for row in ranked
+                if row[0] >= max(.58, best_score - tolerance)
+                and (not best_has_model or row[2]["型号"] >= .78)]
+    fields = [field for field in ("品牌", "型号", "数量", "描述")
+              if any(row[2][field] >= .78 for row in selected)]
+    basis = "+".join(fields) + "综合匹配" if fields else "名称与描述综合匹配"
+    return [row[1] for row in selected], basis
+
+
+def compare_equipment(forward: ContractStructured,backward: ContractStructured) -> list[Difference]:
+    """
+    仅比较前后向合同中的实物设备/材料覆盖情况。
+
+    软件部署、系统集成、实施服务、运维服务等
+    非实物设备项目不进入“设备未覆盖风险”。
+    """
+
     results: list[Difference] = []
-    if not forward.equipment:
+
+    forward_items = [
+        item
+        for item in forward.equipment
+        if _is_equipment_coverage_item(item)
+    ]
+
+    backward_items = [
+        item
+        for item in backward.equipment
+        if _is_equipment_coverage_item(item)
+    ]
+
+    if not forward_items:
         return results
-    for f in forward.equipment:
-        candidates, basis = _matched_candidates(f, backward.equipment)
-        known_quantities = [item.quantity for item in candidates if item.quantity is not None]
-        covered_quantity = sum(known_quantities) if known_quantities else None
-        quantity_satisfied = (f.quantity is None or covered_quantity is None or covered_quantity >= f.quantity)
+
+    for f in forward_items:
+        candidates, basis = _matched_candidates(
+            f,
+            backward_items
+        )
+
+        known_quantities = [
+            item.quantity
+            for item in candidates
+            if item.quantity is not None
+        ]
+
+        covered_quantity = (
+            sum(known_quantities)
+            if known_quantities
+            else None
+        )
+
+        quantity_satisfied = (
+            f.quantity is None
+            or covered_quantity is None
+            or covered_quantity >= f.quantity
+        )
+
         if candidates and quantity_satisfied:
             continue
+
         if candidates:
-            description = (f"已按{basis}找到后向清单项，但汇总数量{covered_quantity:g}"
-                           f"{f.unit or ''}，低于前向要求{f.quantity:g}{f.unit or ''}。")
-            backward_payload = {"匹配依据": basis, "汇总数量": covered_quantity,
-                                "匹配项": [asdict(item) for item in candidates]}
-            results.append(Difference("设备", "后向数量不足", "高风险", "EQ-002", f.standard_name,
-                                      description, asdict(f), backward_payload,
-                                      [f.evidence_id] + [item.evidence_id for item in candidates if item.evidence_id]))
+            description = (
+                f"已按{basis}找到后向清单项，但汇总数量"
+                f"{covered_quantity:g}{f.unit or ''}，"
+                f"低于前向要求{f.quantity:g}{f.unit or ''}。"
+            )
+
+            backward_payload = {
+                "匹配依据": basis,
+                "汇总数量": covered_quantity,
+                "匹配项": [
+                    asdict(item)
+                    for item in candidates
+                ],
+            }
+
+            results.append(
+                Difference(
+                    "设备",
+                    "后向数量不足",
+                    "高风险",
+                    "EQ-002",
+                    f.standard_name,
+                    description,
+                    asdict(f),
+                    backward_payload,
+                    [f.evidence_id]
+                    + [
+                        item.evidence_id
+                        for item in candidates
+                        if item.evidence_id
+                    ],
+                )
+            )
+
         else:
-            description = "该前向清单项在全部后向合同汇总清单中均未找到可靠的型号或名称匹配。"
-            results.append(Difference("设备", "后向未找到", "高风险", "EQ-001", f.standard_name,
-                                      description, asdict(f), {}, [f.evidence_id]))
+            description = (
+                "该前向设备在全部后向合同汇总清单中"
+                "均未找到可靠的型号或名称匹配。"
+            )
+
+            results.append(
+                Difference(
+                    "设备",
+                    "后向未找到",
+                    "高风险",
+                    "EQ-001",
+                    f.standard_name,
+                    description,
+                    asdict(f),
+                    {},
+                    [f.evidence_id],
+                )
+            )
+
     return results
 
 
